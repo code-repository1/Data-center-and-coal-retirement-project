@@ -1,0 +1,3910 @@
+
+---
+Date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r clearall, include=FALSE}
+rm(list = ls())
+```
+
+
+```{r set path, include=FALSE}
+library(haven)
+
+current <- getwd()
+while (basename(current) != "Data_center_and_fossil_energy_Replication") {
+  current <- dirname(current)
+}
+base_path <- current
+
+path_raw     <- file.path(base_path, "Data", "raw")
+path_temp    <- file.path(base_path, "Data", "temp")
+path_use     <- file.path(base_path, "Data", "use")
+path_figures <- file.path(base_path, "Results", "Figures")
+path_tables  <- file.path(base_path, "Results", "Tables")
+
+data <- read_dta(file.path(path_use, "gem_coal_plants_multi_record_sa_proximity_exposure_15_25_50km_forR_clean.dta"))
+```
+
+
+```{r Figure 3a regression session}
+library(haven)
+library(survival)
+library(dplyr)
+
+# Define Treatment Variables
+
+distances <- c("15km", "25km", "50km")
+types <- c("before06", "06_15", "16_19", "20_24")
+
+results_list <- list()
+cox_models_list <- list()
+
+# Run Cox Models
+
+for (dist in distances) {
+  
+  proximity_vars <- paste0("ai_proximity_", dist, "_", types)
+  proximity_formula <- paste(proximity_vars, collapse = " + ")
+  
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    proximity_formula,
+    " + Capacity_MW",
+    " + Start_year", 
+    " + Emission_factor_kg_of_CO2_per_TJ",
+    " + Heat_rate_Btu_per_kWh",
+    " + rGDP_pc",
+    " + strata(Alpha_3_code)"
+  )
+  
+  tryCatch({
+    
+    cox_model <- coxph(
+      as.formula(formula_str), 
+      data = data,
+      cluster = GEM_unit_phase_ID,
+      ties = "efron",
+      control = coxph.control(iter.max = 200)
+    )
+    
+    coef_summary <- summary(cox_model)$coefficients
+    has_robust <- "robust se" %in% colnames(coef_summary)
+    
+    # Get sample size
+    n_obs <- cox_model$n
+    n_events <- cox_model$nevent
+    
+    # extract main coefficients
+    for (i in 1:4) {
+      type <- types[i]
+      var_name <- proximity_vars[i]
+      
+      if (has_robust) {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "robust se"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      } else {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "se(coef)"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      }
+      
+      hr <- exp(coef_val)
+      ci_lower <- exp(coef_val - 1.96 * se)
+      ci_upper <- exp(coef_val + 1.96 * se)
+      
+      result_row <- data.frame(
+        Distance = dist,
+        Type = type,
+        Variable = var_name,
+        Coefficient = coef_val,
+        HR = hr,
+        SE = se,
+        CI_lower = ci_lower,
+        CI_upper = ci_upper,
+        P_value = pval,
+        Sig = case_when(
+          pval < 0.001 ~ "***",
+          pval < 0.01 ~ "**",
+          pval < 0.05 ~ "*",
+          TRUE ~ ""
+        ),
+        N_obs = n_obs,
+        N_events = n_events
+      )
+      
+      results_list[[length(results_list) + 1]] <- result_row
+    }
+    
+    # save results
+    model_key <- paste0(dist, "_all_types")
+    cox_models_list[[model_key]] <- list(
+      model = cox_model,
+      distance = dist,
+      formula = formula_str
+    )
+    
+    cat(sprintf("✓ Successfully fitted model for distance: %s\n", dist))
+    
+  }, error = function(e) {
+    cat(sprintf("✗ Error in distance %s: %s\n", dist, e$message))
+  })
+}
+
+# Save Results
+
+if (length(results_list) == 0) {
+  stop("No models successfully fitted!")
+}
+
+results_df <- bind_rows(results_list) %>%
+  mutate(
+    Distance_num = as.numeric(gsub("km", "", Distance))
+  ) %>%
+  arrange(Distance_num)
+
+saveRDS(results_df, file.path(path_temp, "cox_proximity_results_joint.rds"))
+saveRDS(cox_models_list, file.path(path_temp, "cox_proximity_models_joint.rds"))
+write.csv(results_df, file.path(path_tables, "si_table1_source.csv"), row.names = FALSE)
+
+cat("\nAnalysis completed.\n")
+cat(sprintf("Total distances fitted: %d\n", length(cox_models_list)))
+cat(sprintf("Total coefficients: %d\n", nrow(results_df)))
+cat(sprintf("Significant results (p < 0.05): %d\n", sum(results_df$P_value < 0.05)))
+
+# print main results
+print(results_df %>% dplyr::select(Distance, Type, HR, CI_lower, CI_upper, P_value, Sig, N_obs))
+
+```
+
+
+```{r Schoenfeld_test: Supplementary Table 9}
+
+# Extract main results
+cox_model <- cox_models_list[["25km_all_types"]]$model
+
+# Schoenfeld residual test
+zph_test <- cox.zph(cox_model)
+
+# Extract results
+zph_df <- as.data.frame(zph_test$table)
+zph_df$Variable <- rownames(zph_df)
+
+# Add significance status
+zph_df$Status <- case_when(
+  zph_df$p < 0.001 ~ "***",
+  zph_df$p < 0.01 ~ "**",
+  zph_df$p < 0.05 ~ "*",
+  TRUE ~ ""
+)
+
+# Select and rename columns
+si_table2 <- zph_df %>%
+  dplyr::select(Variable, `χ²` = chisq, `p-value` = p, Status)
+
+# Print results
+cat("--- Individual Continuous Variables ---\n")
+for (i in 1:(nrow(si_table2) - 1)) {
+  cat(sprintf("%s: χ² = %.2f, p = %.4f %s\n",
+              si_table2$Variable[i],
+              si_table2$`χ²`[i],
+              si_table2$`p-value`[i],
+              si_table2$Status[i]))
+}
+
+cat("\n--- Global Test ---\n")
+global_row <- si_table2[si_table2$Variable == "GLOBAL", ]
+cat(sprintf("GLOBAL: χ² = %.2f, p = %.4f %s\n", 
+            global_row$`χ²`,
+            global_row$`p-value`,
+            global_row$Status))
+
+# Save to CSV
+write.csv(si_table2, 
+          file = file.path(path_tables, "si_table8_source.csv"),
+          row.names = FALSE)
+
+cat("\n✓ Table saved to:", file.path(path_tables, "si_table9_source.csv"), "\n")
+cat("========================================\n")
+
+
+```
+```{r time dependent cox: Supplementary Table 2}
+library(haven)
+library(survival)
+library(dplyr)
+
+# Time-Dependent Cox Model
+
+time_transform <- function(x, t, ...) {
+  x * log(t + 1)
+}
+
+# 正确的公式：主效应 + 时间交互
+formula_tt <- as.formula(
+  "Surv(time0, time1, retire) ~ 
+   ai_proximity_25km_before06 + tt(ai_proximity_25km_before06) +
+   ai_proximity_25km_06_15 +
+   ai_proximity_25km_16_19 +
+   ai_proximity_25km_20_24 + tt(ai_proximity_25km_20_24) +
+   Capacity_MW + tt(Capacity_MW) +
+   Start_year + tt(Start_year) +
+   Emission_factor_kg_of_CO2_per_TJ +
+   Heat_rate_Btu_per_kWh + tt(Heat_rate_Btu_per_kWh) +
+   rGDP_pc + tt(rGDP_pc) +
+   strata(Alpha_3_code)"
+)
+
+cox_tt_model <- coxph(
+  formula_tt,
+  data = data,
+  cluster = GEM_unit_phase_ID,
+  ties = "efron",
+  tt = time_transform,
+  control = coxph.control(iter.max = 200)
+)
+
+summary(cox_tt_model)
+
+# Extract and Format Results
+
+coef_summary <- summary(cox_tt_model)$coefficients
+has_robust <- "robust se" %in% colnames(coef_summary)
+
+# Get sample size
+n_obs <- cox_tt_model$n
+n_events <- cox_tt_model$nevent
+
+# define variables to be displayed
+ai_vars <- c(
+  "ai_proximity_25km_before06",
+  "ai_proximity_25km_06_15",
+  "ai_proximity_25km_16_19",
+  "ai_proximity_25km_20_24",
+  "tt(ai_proximity_25km_20_24)"
+)
+
+results_list <- list()
+
+for (i in 1:nrow(coef_summary)) {
+  var_name <- rownames(coef_summary)[i]
+  
+  # extract results for variables above
+  if (!var_name %in% ai_vars) next
+  
+  if (has_robust) {
+    coef_val <- coef_summary[i, "coef"]
+    se <- coef_summary[i, "robust se"]
+    pval <- coef_summary[i, "Pr(>|z|)"]
+  } else {
+    coef_val <- coef_summary[i, "coef"]
+    se <- coef_summary[i, "se(coef)"]
+    pval <- coef_summary[i, "Pr(>|z|)"]
+  }
+  
+  results_list[[length(results_list) + 1]] <- data.frame(
+    Variable = var_name,
+    Type = ifelse(grepl("^tt\\(", var_name), "Time Interaction", "Main Effect"),
+    Coefficient = coef_val,
+    HR = exp(coef_val),
+    SE = se,
+    CI_lower = exp(coef_val - 1.96 * se),
+    CI_upper = exp(coef_val + 1.96 * se),
+    P_value = pval,
+    Sig = case_when(
+      pval < 0.001 ~ "***",
+      pval < 0.01 ~ "**",
+      pval < 0.05 ~ "*",
+      TRUE ~ ""
+    ),
+    N_obs = n_obs,
+    N_events = n_events
+  )
+}
+
+results_df <- bind_rows(results_list)
+
+# save results
+write.csv(results_df, 
+          file.path(path_tables, "si_table2_source.csv"), 
+          row.names = FALSE)
+
+
+```
+
+
+```{r Figure 3a plot session}
+
+library(grid)
+library(gtable)
+library(ggplot2)
+library(dplyr)
+
+# Load results
+if (!file.exists(file.path(path_temp, "cox_proximity_results_joint.rds"))) {
+  stop("Results file not found! Please run Cox regression first.")
+}
+
+results_df <- readRDS(file.path(path_temp, "cox_proximity_results_joint.rds"))
+
+# style
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+AXIS_TEXT_MARGIN <- 4
+AXIS_TITLE_MARGIN <- 8
+LEGEND_KEY_SIZE <- 0.5
+
+FIXED_YTITLE_WIDTH <- unit(1.2, "cm")  
+FIXED_YAXIS_WIDTH <- unit(1.5, "cm")   
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15" = "#4169E1",
+  "16_19" = "#9E1C60",
+  "20_24" = "#FF4500"
+)
+
+period_labels <- c(
+  "before06" = "Before 2006",
+  "06_15" = "2006-2015",
+  "16_19" = "2016-2019",
+  "20_24" = "2020-2024"
+)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(size = FONT_SIZE_TITLE, hjust = 0, 
+                                margin = margin(b = 8)),
+      plot.subtitle = element_text(size = FONT_SIZE_AXIS_TITLE, hjust = 0, 
+                                    margin = margin(b = 8)),
+      plot.caption = element_text(size = FONT_SIZE_CAPTION, hjust = 0, 
+                                  color = "grey20", margin = margin(t = 8), 
+                                  lineheight = 1.1),
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(t = AXIS_TEXT_MARGIN)),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT, 
+        color = "black",
+        hjust = 1.1,              
+        vjust = 1.1,              
+        angle = -30,              
+        margin = margin(r = 4)
+      ),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(t = AXIS_TITLE_MARGIN)),
+      axis.title.y = element_text(
+        size = FONT_SIZE_AXIS_TITLE, 
+        angle = 90,               
+        margin = margin(r = AXIS_TITLE_MARGIN)
+      ),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.y = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",  
+      plot.margin = margin(12, 40, 12, 20),  
+      panel.grid = element_blank()
+    )
+}
+
+plot1_data <- results_df %>%
+  filter(Distance == "25km") %>%
+  mutate(
+    Type_clean = case_when(
+      Type == "before06" ~ "Before 2006",
+      Type == "06_15" ~ "2006-2015",
+      Type == "16_19" ~ "2016-2019",
+      Type == "20_24" ~ "2020-2024",
+      TRUE ~ Type
+    ),
+    Type_factor = factor(Type_clean, levels = c("Before 2006", "2006-2015", "2016-2019", "2020-2024")),
+    plot_order = case_when(
+      Type_clean == "Before 2006" ~ 4,
+      Type_clean == "2006-2015" ~ 3,
+      Type_clean == "2016-2019" ~ 2,
+      Type_clean == "2020-2024" ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+x_min <- min(plot1_data$CI_lower, na.rm = TRUE)
+x_max <- max(plot1_data$CI_upper, na.rm = TRUE)
+x_range <- x_max - x_min
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.30 * x_range
+
+plot1_data <- plot1_data %>%
+  mutate(
+    label_x = pmin(CI_upper + 0.03 * x_range, x_limit_max - 0.10 * x_range),
+    hr_label = sprintf("%.3f%s", HR, Sig)
+  )
+
+forest_plot_25km <- ggplot(plot1_data, aes(x = HR, y = plot_order)) +
+  geom_vline(xintercept = 1, linetype = "solid", 
+             color = "black", linewidth = LINE_WIDTH_AXIS) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = Type), 
+                 height = 0, linewidth = LINE_WIDTH_ERROR) +
+  geom_point(aes(color = Type, fill = Type), 
+             shape = 21, size = POINT_SIZE, stroke = POINT_STROKE) +
+  geom_text(aes(x = label_x, label = hr_label, color = Type), 
+            hjust = 0, size = FONT_SIZE_AXIS_TEXT * 0.35, fontface = "bold",
+            show.legend = FALSE, family = FONT_FAMILY) +
+  scale_color_manual(
+    values = nature_colors, 
+    labels = period_labels,
+    breaks = period_order
+  ) +
+  scale_fill_manual(
+    values = c("before06" = "white", "06_15" = "white", 
+               "16_19" = "white", "20_24" = "white"),
+    guide = "none"
+  ) +
+  labs(
+    x = "Hazard Ratio (95% CI)",
+    y = "Data center construction periods"
+  ) +
+  theme_nature_standard() +
+  scale_x_continuous(
+    limits = c(x_limit_min, x_limit_max),
+    breaks = pretty(c(x_min, x_max), n = 6),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:4,
+    labels = c("2020-2024", "2016-2019", "2006-2015", "Before 2006"),  
+    expand = expansion(add = c(0.5, 0.5))
+  )
+
+
+plot1_grob <- ggplotGrob(forest_plot_25km)
+plot1_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot1_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  filename = file.path(path_figures, "fig3a.pdf"),
+  plot = plot1_grob,
+  width = 5.5,  
+  height = 4, 
+  units = "in",
+  device = "pdf"
+)
+
+print(forest_plot_25km)
+```
+
+
+
+
+
+```{r SI_Figure_2——buffer zone sensitivity: 15km & 50km}
+# 15km & 50km Sensitivity
+
+library(grid)
+library(gtable)
+library(ggplot2)
+library(dplyr)
+
+# Load results
+if (!file.exists(file.path(path_temp, "cox_proximity_results_joint.rds"))) {
+  stop("Results file not found! Please run Cox regression first.")
+}
+
+results_df <- readRDS(file.path(path_temp, "cox_proximity_results_joint.rds"))
+
+# style
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+AXIS_TEXT_MARGIN <- 4
+AXIS_TITLE_MARGIN <- 8
+LEGEND_KEY_SIZE <- 0.5
+
+FIXED_YTITLE_WIDTH <- unit(1.5, "cm")
+FIXED_YAXIS_WIDTH <- unit(2.5, "cm")
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15" = "#4169E1",
+  "16_19" = "#9E1C60",
+  "20_24" = "#FF4500"
+)
+
+period_labels <- c(
+  "before06" = "Before 2006",
+  "06_15" = "2006-2015",
+  "16_19" = "2016-2019",
+  "20_24" = "2020-2024"
+)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(size = FONT_SIZE_TITLE, hjust = 0, 
+                                margin = margin(b = 8)),
+      plot.subtitle = element_text(size = FONT_SIZE_AXIS_TITLE, hjust = 0, 
+                                    margin = margin(b = 8)),
+      plot.caption = element_text(size = FONT_SIZE_CAPTION, hjust = 0, 
+                                  color = "grey20", margin = margin(t = 8), 
+                                  lineheight = 1.1),
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(t = AXIS_TEXT_MARGIN)),
+      axis.text.y = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(r = AXIS_TEXT_MARGIN),
+                                 hjust = 1, vjust = 0.5, lineheight = 0.9),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(t = AXIS_TITLE_MARGIN)),
+      axis.title.y = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(r = AXIS_TITLE_MARGIN)),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = c(0.05, 0.95),
+      legend.justification = c(0, 1),
+      legend.direction = "vertical",
+      legend.background = element_blank(),  
+      legend.title = element_text(size = FONT_SIZE_LEGEND, face = "bold"),
+      legend.text = element_text(size = FONT_SIZE_LEGEND),
+      legend.key.size = unit(LEGEND_KEY_SIZE, "cm"),
+      legend.key.height = unit(LEGEND_KEY_SIZE, "cm"),
+      legend.key.width = unit(LEGEND_KEY_SIZE * 1.5, "cm"),
+      legend.spacing.y = unit(0.1, "cm"),
+      plot.margin = margin(12, 40, 12, 10),
+      panel.grid = element_blank()
+    )
+}
+
+plot2_data <- results_df %>%
+  filter(Distance %in% c("15km", "50km")) %>%
+  mutate(
+    Type_clean = case_when(
+      Type == "before06" ~ "Before 2006",
+      Type == "06_15" ~ "2006-2015",
+      Type == "16_19" ~ "2016-2019",
+      Type == "20_24" ~ "2020-2024",
+      TRUE ~ Type
+    ),
+    Type_factor = factor(Type_clean, levels = c("Before 2006", "2006-2015", "2016-2019", "2020-2024")),
+    Distance_label = gsub("km", " km", Distance),
+    plot_order = case_when(
+      Distance_label == "50 km" & Type_clean == "Before 2006" ~ 8,
+      Distance_label == "50 km" & Type_clean == "2006-2015" ~ 7,
+      Distance_label == "50 km" & Type_clean == "2016-2019" ~ 6,
+      Distance_label == "50 km" & Type_clean == "2020-2024" ~ 5,
+      Distance_label == "15 km" & Type_clean == "Before 2006" ~ 4,
+      Distance_label == "15 km" & Type_clean == "2006-2015" ~ 3,
+      Distance_label == "15 km" & Type_clean == "2016-2019" ~ 2,
+      Distance_label == "15 km" & Type_clean == "2020-2024" ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+x_min2 <- min(plot2_data$CI_lower, na.rm = TRUE)
+x_max2 <- max(plot2_data$CI_upper, na.rm = TRUE)
+x_range2 <- x_max2 - x_min2
+x_limit_min2 <- x_min2 - 0.15 * x_range2
+x_limit_max2 <- x_max2 + 0.30 * x_range2
+
+plot2_data <- plot2_data %>%
+  mutate(
+    label_x = pmin(CI_upper + 0.03 * x_range2, x_limit_max2 - 0.10 * x_range2),
+    hr_label = sprintf("%.3f%s", HR, Sig)
+  )
+
+distance_breaks2 <- plot2_data %>%
+  group_by(Distance_label) %>%
+  summarise(y_mid = mean(plot_order)) %>%
+  arrange(y_mid)
+
+# grey backgroud
+background_rects2 <- data.frame(
+  ymin = 0.5,
+  ymax = 4.5
+)
+
+forest_plot_sensitivity <- ggplot(plot2_data, aes(x = HR, y = plot_order)) +
+  geom_rect(data = background_rects2,
+            aes(xmin = -Inf, xmax = Inf, ymin = ymin, ymax = ymax),
+            fill = "grey95", alpha = 0.5, inherit.aes = FALSE) +
+  geom_vline(xintercept = 1, linetype = "solid", 
+             color = "black", linewidth = LINE_WIDTH_AXIS) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = Type), 
+                 height = 0, linewidth = LINE_WIDTH_ERROR) +
+  geom_point(aes(color = Type, fill = Type), 
+             shape = 21, size = POINT_SIZE, stroke = POINT_STROKE) +
+  geom_text(aes(x = label_x, label = hr_label, color = Type), 
+            hjust = 0, size = FONT_SIZE_AXIS_TEXT * 0.35, fontface = "bold",
+            show.legend = FALSE, family = FONT_FAMILY) +
+  scale_color_manual(
+    values = nature_colors, 
+    labels = period_labels,
+    breaks = period_order,
+    name = "Construction Period"
+  ) +
+  scale_fill_manual(
+    values = c("before06" = "white", "06_15" = "white", 
+               "16_19" = "white", "20_24" = "white"),
+    guide = "none"
+  ) +
+  guides(
+    color = guide_legend(
+      override.aes = list(
+        size = POINT_SIZE,
+        stroke = POINT_STROKE,
+        shape = 21,
+        fill = "white",
+        linewidth = LINE_WIDTH_ERROR
+      )
+    )
+  ) +
+  labs(
+    x = "Hazard Ratio (95% CI)",
+    y = "Buffer Distance"
+  ) +
+  theme_nature_standard() +
+  scale_x_continuous(
+    limits = c(x_limit_min2, x_limit_max2),
+    breaks = pretty(c(x_min2, x_max2), n = 6),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = distance_breaks2$y_mid,
+    labels = distance_breaks2$Distance_label,
+    expand = expansion(add = c(0.5, 0.5))
+  )
+
+plot2_grob <- ggplotGrob(forest_plot_sensitivity)
+plot2_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot2_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  filename = file.path(path_figures, "si_fig2.pdf"),
+  plot = plot2_grob,
+  width = 6.5, 
+  height = 5, 
+  units = "in",
+  device = "pdf"
+)
+
+print(forest_plot_sensitivity)
+
+```
+
+
+```{r SI_Table 10: dc all without distinguished periods}
+library(haven)
+library(survival)
+library(dplyr)
+
+# ========================================
+# Step 1: Generate Cumulative Exposure Variable
+# ========================================
+
+data <- data %>%
+  mutate(
+    ai_proximity_25km_cumulative = 
+      ai_proximity_25km_before06 + 
+      ai_proximity_25km_06_15 + 
+      ai_proximity_25km_16_19 + 
+      ai_proximity_25km_20_24
+  )
+
+# ========================================
+# Step 2: Run Cox Model (Silent)
+# ========================================
+
+results_list_cumulative <- list()
+cox_models_list_cumulative <- list()
+
+formula_str_cumulative <- paste0(
+  "Surv(time0, time1, retire) ~ ",
+  "ai_proximity_25km_cumulative",
+  " + Capacity_MW + Start_year + Emission_factor_kg_of_CO2_per_TJ",
+  " + Heat_rate_Btu_per_kWh + rGDP_pc + strata(Alpha_3_code)"
+)
+
+# Fit model silently
+cox_model_cumulative <- suppressWarnings(
+  coxph(
+    as.formula(formula_str_cumulative), 
+    data = data,
+    cluster = GEM_unit_phase_ID,
+    ties = "efron",
+    control = coxph.control(iter.max = 200)
+  )
+)
+
+# Extract results
+coef_summary <- summary(cox_model_cumulative)$coefficients
+has_robust <- "robust se" %in% colnames(coef_summary)
+
+if (has_robust) {
+  coef_val <- coef_summary[1, "coef"]
+  se <- coef_summary[1, "robust se"]
+  pval <- coef_summary[1, "Pr(>|z|)"]
+} else {
+  coef_val <- coef_summary[1, "coef"]
+  se <- coef_summary[1, "se(coef)"]
+  pval <- coef_summary[1, "Pr(>|z|)"]
+}
+
+hr <- exp(coef_val)
+ci_lower <- exp(coef_val - 1.96 * se)
+ci_upper <- exp(coef_val + 1.96 * se)
+
+results_df_cumulative <- data.frame(
+  Distance = "25km",
+  Type = "Cumulative",
+  Variable = "ai_proximity_25km_cumulative",
+  Coefficient = coef_val,
+  HR = hr,
+  SE = se,
+  CI_lower = ci_lower,
+  CI_upper = ci_upper,
+  P_value = pval,
+  Sig = case_when(
+    pval < 0.001 ~ "***",
+    pval < 0.01 ~ "**",
+    pval < 0.05 ~ "*",
+    TRUE ~ ""
+  ),
+  N_obs = cox_model_cumulative$n,
+  N_events = cox_model_cumulative$nevent
+)
+
+# ========================================
+# Step 3: Save Results
+# ========================================
+
+saveRDS(results_df_cumulative, 
+        file.path(path_temp, "cox_proximity_results_cumulative_25km.rds"))
+
+saveRDS(list("25km_cumulative" = list(
+  model = cox_model_cumulative,
+  distance = "25km",
+  formula = formula_str_cumulative
+)), file.path(path_temp, "cox_proximity_models_cumulative_25km.rds"))
+
+write.csv(results_df_cumulative, 
+          file.path(path_tables, "si_table9_source.csv"), 
+          row.names = FALSE)
+
+cat("✓ Results saved to:", file.path(path_tables, "si_table10_source.csv"), "\n")
+
+
+```
+
+```{r SI_Figure 3: robustness check strata by year calculation session}
+library(haven)
+library(survival)
+library(dplyr)
+
+# Year Stratification Robustness Check
+
+distances <- c("25km")
+types <- c("before06", "06_15", "16_19", "20_24")
+
+results_year_strata_list <- list()
+cox_models_year_strata_list <- list()
+
+
+# Run Cox Models with Year Stratification
+
+for (dist in distances) {
+  
+  proximity_vars <- paste0("ai_proximity_", dist, "_", types)
+  proximity_formula <- paste(proximity_vars, collapse = " + ")
+  
+  formula_str_year <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    proximity_formula,
+    " + Capacity_MW",
+    " + Start_year", 
+    " + Emission_factor_kg_of_CO2_per_TJ",
+    " + Heat_rate_Btu_per_kWh",
+    " + rGDP_pc",
+    " + strata(Alpha_3_code)",
+    " + strata(year)"
+  )
+  
+  tryCatch({
+    
+    cox_model_year <- coxph(
+      as.formula(formula_str_year), 
+      data = data,
+      cluster = GEM_unit_phase_ID,
+      ties = "efron",
+      control = coxph.control(iter.max = 200)
+    )
+    
+    coef_summary <- summary(cox_model_year)$coefficients
+    has_robust <- "robust se" %in% colnames(coef_summary)
+    
+    for (i in 1:4) {
+      type <- types[i]
+      var_name <- proximity_vars[i]
+      
+      if (has_robust) {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "robust se"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      } else {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "se(coef)"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      }
+      
+      hr <- exp(coef_val)
+      ci_lower <- exp(coef_val - 1.96 * se)
+      ci_upper <- exp(coef_val + 1.96 * se)
+      
+      result_row <- data.frame(
+        Distance = dist,
+        Type = type,
+        Variable = var_name,
+        Coefficient = coef_val,
+        HR = hr,
+        SE = se,
+        CI_lower = ci_lower,
+        CI_upper = ci_upper,
+        P_value = pval,
+        Sig = case_when(
+          pval < 0.001 ~ "***",
+          pval < 0.01 ~ "**",
+          pval < 0.05 ~ "*",
+          TRUE ~ ""
+        )
+      )
+      
+      results_year_strata_list[[length(results_year_strata_list) + 1]] <- result_row
+    }
+    
+    model_key <- paste0(dist, "_all_types_year_strata")
+    cox_models_year_strata_list[[model_key]] <- list(
+      model = cox_model_year,
+      distance = dist,
+      formula = formula_str_year
+    )
+    
+    cat(sprintf("✓ Successfully fitted model for distance: %s\n", dist))
+    
+  }, error = function(e) {
+    cat(sprintf("✗ Error in distance %s: %s\n", dist, e$message))
+  })
+}
+
+
+# Process Results
+
+if (length(results_year_strata_list) == 0) {
+  stop("No models successfully fitted!")
+}
+
+results_year_strata_df <- bind_rows(results_year_strata_list) %>%
+  mutate(
+    Distance_num = as.numeric(gsub("km", "", Distance))
+  ) %>%
+  arrange(Distance_num)
+
+saveRDS(results_year_strata_df, file.path(path_temp, "cox_proximity_results_year_strata.rds"))
+saveRDS(cox_models_year_strata_list, file.path(path_temp, "cox_proximity_models_year_strata.rds"))
+write.csv(results_year_strata_df, file.path(path_tables, "cox_proximity_results_year_strata.csv"), row.names = FALSE)
+
+cat("\nAnalysis completed.\n")
+cat(sprintf("Total distances fitted: %d\n", length(cox_models_year_strata_list)))
+cat(sprintf("Total coefficients: %d\n", nrow(results_year_strata_df)))
+cat(sprintf("Significant results (p < 0.05): %d\n", sum(results_year_strata_df$P_value < 0.05)))
+
+print(results_year_strata_df %>% dplyr::select(Distance, Type, HR, CI_lower, CI_upper, P_value, Sig))
+
+
+```
+
+
+```{r SI_Figure 3: robustness check strata by year plot session}
+
+library(grid)
+library(gtable)
+library(ggplot2)
+library(dplyr)
+
+# Load year stratification results
+if (!file.exists(file.path(path_temp, "cox_proximity_results_year_strata.rds"))) {
+  stop("Year stratification results file not found! Please run the analysis first.")
+}
+
+results_year_strata_df <- readRDS(file.path(path_temp, "cox_proximity_results_year_strata.rds"))
+
+# style
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+AXIS_TEXT_MARGIN <- 4
+AXIS_TITLE_MARGIN <- 8
+LEGEND_KEY_SIZE <- 0.5
+
+FIXED_YTITLE_WIDTH <- unit(1.2, "cm")
+FIXED_YAXIS_WIDTH <- unit(1.5, "cm")
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15" = "#4169E1",
+  "16_19" = "#9E1C60",
+  "20_24" = "#FF4500"
+)
+
+period_labels <- c(
+  "before06" = "Before 2006",
+  "06_15" = "2006-2015",
+  "16_19" = "2016-2019",
+  "20_24" = "2020-2024"
+)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(size = FONT_SIZE_TITLE, hjust = 0, 
+                                margin = margin(b = 8)),
+      plot.subtitle = element_text(size = FONT_SIZE_AXIS_TITLE, hjust = 0, 
+                                    margin = margin(b = 8)),
+      plot.caption = element_text(size = FONT_SIZE_CAPTION, hjust = 0, 
+                                  color = "grey20", margin = margin(t = 8), 
+                                  lineheight = 1.1),
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(t = AXIS_TEXT_MARGIN)),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT, 
+        color = "black",
+        hjust = 1.1,
+        vjust = 1.1,
+        angle = -30,
+        margin = margin(r = 4)
+      ),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(t = AXIS_TITLE_MARGIN)),
+      axis.title.y = element_text(
+        size = FONT_SIZE_AXIS_TITLE, 
+        angle = 90,
+        margin = margin(r = AXIS_TITLE_MARGIN)
+      ),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.y = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.margin = margin(12, 40, 12, 20),
+      panel.grid = element_blank()
+    )
+}
+
+plot_year_strata_data <- results_year_strata_df %>%
+  filter(Distance == "25km") %>%
+  mutate(
+    Type_clean = case_when(
+      Type == "before06" ~ "Before 2006",
+      Type == "06_15" ~ "2006-2015",
+      Type == "16_19" ~ "2016-2019",
+      Type == "20_24" ~ "2020-2024",
+      TRUE ~ Type
+    ),
+    Type_factor = factor(Type_clean, levels = c("Before 2006", "2006-2015", "2016-2019", "2020-2024")),
+    plot_order = case_when(
+      Type_clean == "Before 2006" ~ 4,
+      Type_clean == "2006-2015" ~ 3,
+      Type_clean == "2016-2019" ~ 2,
+      Type_clean == "2020-2024" ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+x_min <- min(plot_year_strata_data$CI_lower, na.rm = TRUE)
+x_max <- max(plot_year_strata_data$CI_upper, na.rm = TRUE)
+x_range <- x_max - x_min
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.30 * x_range
+
+plot_year_strata_data <- plot_year_strata_data %>%
+  mutate(
+    label_x = pmin(CI_upper + 0.03 * x_range, x_limit_max - 0.10 * x_range),
+    hr_label = sprintf("%.3f%s", HR, Sig)
+  )
+
+forest_plot_year_strata <- ggplot(plot_year_strata_data, aes(x = HR, y = plot_order)) +
+  geom_vline(xintercept = 1, linetype = "solid", 
+             color = "black", linewidth = LINE_WIDTH_AXIS) +
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = Type), 
+                 height = 0, linewidth = LINE_WIDTH_ERROR) +
+  geom_point(aes(color = Type, fill = Type), 
+             shape = 21, size = POINT_SIZE, stroke = POINT_STROKE) +
+  geom_text(aes(x = label_x, label = hr_label, color = Type), 
+            hjust = 0, size = FONT_SIZE_AXIS_TEXT * 0.35, fontface = "bold",
+            show.legend = FALSE, family = FONT_FAMILY) +
+  scale_color_manual(
+    values = nature_colors, 
+    labels = period_labels,
+    breaks = period_order
+  ) +
+  scale_fill_manual(
+    values = c("before06" = "white", "06_15" = "white", 
+               "16_19" = "white", "20_24" = "white"),
+    guide = "none"
+  ) +
+  labs(
+    x = "Hazard Ratio (95% CI)",
+    y = "Data center construction periods",
+  ) +
+  theme_nature_standard() +
+  scale_x_continuous(
+    limits = c(x_limit_min, x_limit_max),
+    breaks = pretty(c(x_min, x_max), n = 6),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:4,
+    labels = c("2020-2024", "2016-2019", "2006-2015", "Before 2006"),
+    expand = expansion(add = c(0.5, 0.5))
+  )
+
+# create figure frame
+plot_year_strata_grob <- ggplotGrob(forest_plot_year_strata)
+plot_year_strata_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot_year_strata_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  filename = file.path(path_figures, "si_fig3.pdf"),
+  plot = plot_year_strata_grob,
+  width = 5.5,
+  height = 4, 
+  units = "in",
+  device = "pdf"
+)
+
+print(forest_plot_year_strata)
+
+```
+
+
+
+```{r robustness：SI_Figure 4 plot session: Restrict sample to units surviving to 2020}
+library(survival)
+library(dplyr)
+
+# =========================
+# 1. Restrict sample to units surviving to 2020
+#    Keep all observations for these units
+# =========================
+
+units_surviving_to_2020 <- data %>%
+  group_by(GEM_unit_phase_ID) %>%
+  summarise(
+    retired_before_2020 = any(retire == 1 & year < 2020, na.rm = TRUE),
+    observed_in_or_after_2020 = any(year >= 2020, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(!retired_before_2020 & observed_in_or_after_2020) %>%
+  pull(GEM_unit_phase_ID)
+
+data_survivor2020 <- data %>%
+  filter(GEM_unit_phase_ID %in% units_surviving_to_2020) %>%
+  arrange(GEM_unit_phase_ID, year, time0, time1)
+
+cat("Restricted sample summary (units surviving to 2020):\n")
+cat(sprintf("Rows kept: %d\n", nrow(data_survivor2020)))
+cat(sprintf("Units kept: %d\n", n_distinct(data_survivor2020$GEM_unit_phase_ID)))
+cat(sprintf("Events kept: %d\n\n", sum(data_survivor2020$retire, na.rm = TRUE)))
+
+# optional check
+check_entry <- data_survivor2020 %>%
+  group_by(GEM_unit_phase_ID) %>%
+  summarise(
+    first_year = min(year, na.rm = TRUE),
+    last_year = max(year, na.rm = TRUE),
+    ever_retired = any(retire == 1, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+print(head(check_entry, 10))
+
+# =========================
+# 2. Define treatment variables
+# =========================
+
+distances <- c("25km")
+types <- c("before06", "06_15", "16_19", "20_24")
+
+results_list <- list()
+cox_models_list <- list()
+
+# =========================
+# 3. Cox models on restricted sample
+# =========================
+
+for (dist in distances) {
+  
+  proximity_vars <- paste0("ai_proximity_", dist, "_", types)
+  proximity_formula <- paste(proximity_vars, collapse = " + ")
+  
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    proximity_formula,
+    " + Capacity_MW",
+    " + Start_year",
+    " + Emission_factor_kg_of_CO2_per_TJ",
+    " + Heat_rate_Btu_per_kWh",
+    " + rGDP_pc",
+    " + strata(Country_Area)"
+  )
+  
+  tryCatch({
+    
+    cox_model <- coxph(
+      as.formula(formula_str),
+      data = data_survivor2020,
+      cluster = GEM_unit_phase_ID,
+      ties = "efron",
+      control = coxph.control(iter.max = 200)
+    )
+    
+    coef_summary <- summary(cox_model)$coefficients
+    has_robust <- "robust se" %in% colnames(coef_summary)
+    
+    n_obs <- cox_model$n
+    n_events <- cox_model$nevent
+    
+    for (var_name in proximity_vars) {
+      
+      type <- sub(paste0("^ai_proximity_", dist, "_"), "", var_name)
+      
+      if (!(var_name %in% rownames(coef_summary))) next
+      
+      if (has_robust) {
+        coef_val <- coef_summary[var_name, "coef"]
+        se <- coef_summary[var_name, "robust se"]
+        pval <- coef_summary[var_name, "Pr(>|z|)"]
+      } else {
+        coef_val <- coef_summary[var_name, "coef"]
+        se <- coef_summary[var_name, "se(coef)"]
+        pval <- coef_summary[var_name, "Pr(>|z|)"]
+      }
+      
+      hr <- exp(coef_val)
+      ci_lower <- exp(coef_val - 1.96 * se)
+      ci_upper <- exp(coef_val + 1.96 * se)
+      
+      results_list[[length(results_list) + 1]] <- data.frame(
+        Distance = dist,
+        Type = type,
+        Variable = var_name,
+        Coefficient = coef_val,
+        HR = hr,
+        SE = se,
+        CI_lower = ci_lower,
+        CI_upper = ci_upper,
+        P_value = pval,
+        Sig = case_when(
+          pval < 0.001 ~ "***",
+          pval < 0.01 ~ "**",
+          pval < 0.05 ~ "*",
+          TRUE ~ ""
+        ),
+        N_obs = n_obs,
+        N_events = n_events
+      )
+    }
+    
+    cox_models_list[[paste0(dist, "_all_types_survivor2020")]] <- cox_model
+    cat(sprintf("✓ Fitted survivor-to-2020 model: %s\n", dist))
+    
+  }, error = function(e) {
+    cat(sprintf("✗ Error for %s: %s\n", dist, e$message))
+  })
+}
+
+# =========================
+# 4. Output results
+# =========================
+
+if (length(results_list) == 0) {
+  stop("No models successfully fitted.")
+}
+
+results_df_survivor2020 <- bind_rows(results_list) %>%
+  mutate(Distance_num = as.numeric(gsub("km", "", Distance))) %>%
+  arrange(Distance_num)
+
+saveRDS(results_df_survivor2020, file.path(path_temp, "results_df_survivor2020.rds"))
+write.csv(results_df_survivor2020, file.path(path_tables, "results_df_survivor2020.csv"), row.names = FALSE)
+
+cat("\nAnalysis completed.\n")
+cat(sprintf("Total models fitted: %d\n", length(cox_models_list)))
+cat(sprintf("Total coefficients: %d\n", nrow(results_df_survivor2020)))
+cat(sprintf("Significant results (p < 0.05): %d\n\n",
+            sum(results_df_survivor2020$P_value < 0.05, na.rm = TRUE)))
+
+print(
+  results_df_survivor2020 %>%
+    select(Distance, Type, HR, CI_lower, CI_upper, P_value, Sig, N_obs, N_events)
+)
+```
+
+
+```{r robustness_SI_Figure4_plot_session_survivor2020}
+library(grid)
+library(gtable)
+library(ggplot2)
+library(dplyr)
+
+# ============================================================
+# 1. Load results
+# ============================================================
+
+if (!exists("results_df_survivor2020")) {
+  if (file.exists(file.path(path_temp, "results_df_survivor2020.rds"))) {
+    results_df_survivor2020 <- readRDS(file.path(path_temp, "results_df_survivor2020.rds"))
+  } else {
+    stop("results_df_survivor2020 not found in memory and RDS file does not exist.")
+  }
+}
+
+# ============================================================
+# 2. Nature-style settings
+# ============================================================
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+AXIS_TEXT_MARGIN <- 4
+AXIS_TITLE_MARGIN <- 8
+
+FIXED_YTITLE_WIDTH <- unit(1.2, "cm")
+FIXED_YAXIS_WIDTH  <- unit(1.5, "cm")
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15"    = "#4169E1",
+  "16_19"    = "#9E1C60",
+  "20_24"    = "#FF4500"
+)
+
+period_labels <- c(
+  "before06" = "Before 2006",
+  "06_15"    = "2006-2015",
+  "16_19"    = "2016-2019",
+  "20_24"    = "2020-2024"
+)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(
+        size = FONT_SIZE_TITLE,
+        hjust = 0,
+        margin = margin(b = 8)
+      ),
+      plot.subtitle = element_text(
+        size = FONT_SIZE_AXIS_TITLE,
+        hjust = 0,
+        margin = margin(b = 8)
+      ),
+      plot.caption = element_text(
+        size = FONT_SIZE_CAPTION,
+        hjust = 0,
+        color = "grey20",
+        margin = margin(t = 8),
+        lineheight = 1.1
+      ),
+      axis.text.x = element_text(
+        size = FONT_SIZE_AXIS_TEXT,
+        color = "black",
+        margin = margin(t = AXIS_TEXT_MARGIN)
+      ),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT,
+        color = "black",
+        hjust = 1.1,
+        vjust = 1.1,
+        angle = -30,
+        margin = margin(r = 4)
+      ),
+      axis.title.x = element_text(
+        size = FONT_SIZE_AXIS_TITLE,
+        margin = margin(t = AXIS_TITLE_MARGIN)
+      ),
+      axis.title.y = element_text(
+        size = FONT_SIZE_AXIS_TITLE,
+        angle = 90,
+        margin = margin(r = AXIS_TITLE_MARGIN)
+      ),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.y = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.margin = margin(12, 40, 12, 20),
+      panel.grid = element_blank()
+    )
+}
+
+# ============================================================
+# 3. Prepare plotting data
+# ============================================================
+
+plot_data <- results_df_survivor2020 %>%
+  filter(Distance == "25km") %>%
+  mutate(
+    Type_clean = recode(
+      Type,
+      "before06" = "Before 2006",
+      "06_15"    = "2006-2015",
+      "16_19"    = "2016-2019",
+      "20_24"    = "2020-2024"
+    ),
+    plot_order = case_when(
+      Type_clean == "Before 2006" ~ 4,
+      Type_clean == "2006-2015"   ~ 3,
+      Type_clean == "2016-2019"   ~ 2,
+      Type_clean == "2020-2024"   ~ 1,
+      TRUE ~ NA_real_
+    ),
+    hr_label = sprintf("%.3f%s", HR, Sig)
+  ) %>%
+  arrange(desc(plot_order))
+
+if (nrow(plot_data) == 0) {
+  stop("No data available for plotting at Distance == '25km'.")
+}
+
+# ============================================================
+# 4. Axis range and label positions
+# ============================================================
+
+x_min <- min(plot_data$CI_lower, na.rm = TRUE)
+x_max <- max(plot_data$CI_upper, na.rm = TRUE)
+x_range <- x_max - x_min
+
+if (x_range == 0) {
+  x_range <- 0.05
+}
+
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.30 * x_range
+
+plot_data <- plot_data %>%
+  mutate(
+    label_x = pmin(CI_upper + 0.03 * x_range, x_limit_max - 0.10 * x_range)
+  )
+
+# ============================================================
+# 5. Create forest plot
+# ============================================================
+
+forest_plot_survivor2020 <- ggplot(plot_data, aes(x = HR, y = plot_order)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "solid",
+    color = "black",
+    linewidth = LINE_WIDTH_AXIS
+  ) +
+  geom_errorbarh(
+    aes(xmin = CI_lower, xmax = CI_upper, color = Type),
+    height = 0,
+    linewidth = LINE_WIDTH_ERROR
+  ) +
+  geom_point(
+    aes(color = Type, fill = Type),
+    shape = 21,
+    size = POINT_SIZE,
+    stroke = POINT_STROKE
+  ) +
+  geom_text(
+    aes(x = label_x, label = hr_label, color = Type),
+    hjust = 0,
+    vjust = 0.5,
+    size = FONT_SIZE_AXIS_TEXT * 0.35,
+    fontface = "bold",
+    show.legend = FALSE,
+    family = FONT_FAMILY
+  ) +
+  scale_color_manual(
+    values = nature_colors,
+    labels = period_labels,
+    breaks = period_order
+  ) +
+  scale_fill_manual(
+    values = c(
+      "before06" = "white",
+      "06_15"    = "white",
+      "16_19"    = "white",
+      "20_24"    = "white"
+    ),
+    guide = "none"
+  ) +
+  scale_x_continuous(
+    limits = c(0.88, 1.08),
+    breaks = c(0.90, 0.95, 1.00, 1.05),
+    labels = function(x) sprintf("%.2f", x),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:4,
+    labels = c("2020-2024", "2016-2019", "2006-2015", "Before 2006"),
+    expand = expansion(add = c(0.5, 0.5))
+  ) +
+  labs(
+    title = "Effect of data center exposure on coal plant retirement",
+    subtitle = "Restricted sample of units surviving to 2020, 25-km threshold",
+    x = "Hazard ratio (95% CI)",
+    y = "Data center commissioning period",
+    caption = paste(
+      "***P < 0.001, **P < 0.01, *P < 0.05",
+      "HR < 1 indicates delayed retirement; HR > 1 indicates accelerated retirement",
+      "Cox model estimated after excluding units retired before 2020; full observation histories retained for remaining units",
+      sep = "\n"
+    )
+  ) +
+  theme_nature_standard()
+
+# ============================================================
+# 6. Fix y-axis layout width for alignment
+# ============================================================
+
+plot_grob <- ggplotGrob(forest_plot_survivor2020)
+plot_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+# ============================================================
+# 7. Save plot
+# ============================================================
+
+ggsave(
+  filename = file.path(path_figures, "si_fig4.pdf"),
+  plot = plot_grob,
+  width = 5.5,
+  height = 4,
+  units = "in",
+  device = "pdf"
+)
+
+# ============================================================
+# 8. Print plot and summary table
+# ============================================================
+
+print(forest_plot_survivor2020)
+
+cat("\n✓ Plot saved: si_fig4.pdf\n")
+
+cat("\n=== Results Summary: Restricted sample of units surviving to 2020 ===\n")
+print(
+  plot_data %>%
+    transmute(
+      Period = Type_clean,
+      HR = round(HR, 3),
+      CI = sprintf("[%.3f, %.3f]", CI_lower, CI_upper),
+      P_value = sprintf("%.4f", P_value),
+      Sig = Sig,
+      N_obs = N_obs,
+      N_events = N_events
+    )
+)
+
+```
+
+
+```{r fig_3b: marginal survival curves calculation session}
+
+library(survival)
+library(dplyr)
+
+# ===== Step 1: Load Model and Define Parameters =====
+# Load pre-fitted Cox models from saved RDS file
+# Specify the model key and target exposure variable for analysis
+
+cox_models_list <- readRDS(file.path(path_temp, "cox_proximity_models_joint.rds"))
+
+model_key <- "25km_all_types"  
+var_name <- "ai_proximity_25km_20_24"  
+
+cat(sprintf("Loading model: %s\n", model_key))
+cat(sprintf("Target variable: %s\n\n", var_name))
+
+cox_model <- cox_models_list[[model_key]]$model
+
+if (is.null(cox_model)) {
+  stop(sprintf("Model '%s' not found in cox_models_list!", model_key))
+}
+
+# ===== Step 2: Calculate Exposure Levels =====
+# min_val: baseline for "no exposure" (minimum value of the variable)
+# mean_exposed: average exposure level among exposed units
+# These two values define the contrast for counterfactual comparison
+
+min_val <- min(data[[var_name]], na.rm = TRUE)
+exposed_vals <- data[[var_name]][data[[var_name]] > min_val]
+mean_exposed <- mean(exposed_vals, na.rm = TRUE)
+
+cat(sprintf("Exposure levels:\n"))
+cat(sprintf("  No exposure: %.4f\n", min_val))
+cat(sprintf("  Exposed: %.4f\n\n", mean_exposed))
+
+# ===== Step 3: Extract Strata Information =====
+# Group data by country (Alpha_3_code)
+# Calculate sample size (n) and weight for each stratum
+# Weights are used for marginalization (weighted averaging) later
+
+strata_info <- data %>%
+  group_by(Alpha_3_code) %>% 
+  summarise(n = n(), .groups = "drop") %>%
+  arrange(desc(n)) %>%
+  mutate(weight = n / sum(n))
+
+cat(sprintf("Total strata: %d\n\n", nrow(strata_info)))
+
+required_vars <- c(
+  "ai_proximity_25km_before06",
+  "ai_proximity_25km_06_15",
+  "ai_proximity_25km_16_19",
+  "ai_proximity_25km_20_24",  
+  "Capacity_MW",
+  "Start_year",
+  "Emission_factor_kg_of_CO2_per_TJ",
+  "Heat_rate_Btu_per_kWh",
+  "rGDP_pc",
+  "Alpha_3_code"
+)
+
+# ===== Step 4: Calculate Survival Curves for Each Stratum =====
+# For each country (stratum):
+#   4.1 Get a template row with complete data
+#   4.2 Create two scenarios: no AI exposure vs. AI exposure
+#       - Set all other covariates to their global means (held constant)
+#       - Only vary the target variable (ai_proximity_25km_20_24)
+#   4.3 Predict survival curves using survfit() for both scenarios
+#   4.4 Store results
+
+strata_curves <- list()
+pb <- txtProgressBar(min = 0, max = nrow(strata_info), style = 3)
+
+for (i in 1:nrow(strata_info)) {
+  setTxtProgressBar(pb, i)
+  strata_row <- strata_info[i, ]
+  
+  tryCatch({
+    # Get a template row
+    template_row <- data %>%
+      filter(
+        Alpha_3_code == strata_row$Alpha_3_code,
+        complete.cases(data[, required_vars])
+      ) %>%
+      slice(1)
+    
+    if (nrow(template_row) == 0) next
+    
+    # Create two scenarios: no AI exposure vs. AI exposure
+    newdata_no_ai <- template_row[, required_vars]
+    newdata_ai <- template_row[, required_vars]
+    
+    # Set all other covariates to their global means
+    continuous_vars <- c(
+      "ai_proximity_25km_before06",  
+      "ai_proximity_25km_06_15",
+      "ai_proximity_25km_16_19",
+      # "ai_proximity_25km_20_24",  # Only vary the target variable
+      "Capacity_MW",
+      "Start_year",
+      "Emission_factor_kg_of_CO2_per_TJ",
+      "Heat_rate_Btu_per_kWh",
+      "rGDP_pc"
+    )
+    
+    for (var in continuous_vars) {
+      newdata_no_ai[[var]] <- mean(data[[var]], na.rm = TRUE)
+      newdata_ai[[var]] <- mean(data[[var]], na.rm = TRUE)
+    }
+    
+    # Only vary the target variable
+    newdata_no_ai[["ai_proximity_25km_20_24"]] <- min_val
+    newdata_ai[["ai_proximity_25km_20_24"]] <- mean_exposed
+    
+    # Predict survival curves
+    surv_no_ai <- suppressWarnings(survfit(cox_model, newdata = newdata_no_ai))
+    surv_ai <- suppressWarnings(survfit(cox_model, newdata = newdata_ai))
+    
+    if (length(surv_no_ai$time) == 0 || length(surv_ai$time) == 0) next
+    
+    strata_curves[[length(strata_curves) + 1]] <- list(
+      no_ai = data.frame(
+        time = surv_no_ai$time, 
+        surv = surv_no_ai$surv, 
+        weight = strata_row$weight
+      ),
+      ai = data.frame(
+        time = surv_ai$time, 
+        surv = surv_ai$surv, 
+        weight = strata_row$weight
+      ),
+      strata_id = i, 
+      country = strata_row$Alpha_3_code,
+      n = strata_row$n
+    )
+    
+  }, error = function(e) {
+    cat(sprintf("\nError in strata %d (%s): %s\n", 
+                i, strata_row$Alpha_3_code, e$message))
+  })
+}
+
+close(pb)
+cat(sprintf("\n✓ Successfully processed: %d/%d strata\n\n", 
+            length(strata_curves), nrow(strata_info)))
+
+if (length(strata_curves) == 0) {
+  stop("No strata successfully processed!")
+}
+
+# Store results with stratum weight
+
+all_times_no_ai <- sort(unique(unlist(lapply(strata_curves, function(x) x$no_ai$time))))
+all_times_ai <- sort(unique(unlist(lapply(strata_curves, function(x) x$ai$time))))
+
+calc_weighted_surv <- function(time_points, curves_list, scenario) {
+  sapply(time_points, function(t) {
+    surv_at_t <- sapply(curves_list, function(curve) {
+      curve_data <- curve[[scenario]]
+      idx <- which(curve_data$time <= t)
+      if (length(idx) > 0) curve_data$surv[max(idx)] else 1
+    })
+    weights <- sapply(curves_list, function(x) x[[scenario]]$weight[1])
+    sum(surv_at_t * weights) / sum(weights)
+  })
+}
+
+surv_no_ai_marginal <- calc_weighted_surv(all_times_no_ai, strata_curves, "no_ai")
+surv_ai_marginal <- calc_weighted_surv(all_times_ai, strata_curves, "ai")
+
+# format
+survival_df <- bind_rows(
+  data.frame(
+    time = 0, 
+    Survival = 1, 
+    AI_Status = c("No AI Exposure", "AI Exposure")
+  ),
+  data.frame(
+    time = all_times_no_ai, 
+    Survival = surv_no_ai_marginal, 
+    AI_Status = "No AI Exposure"
+  ),
+  data.frame(
+    time = all_times_ai, 
+    Survival = surv_ai_marginal, 
+    AI_Status = "AI Exposure"
+  )
+) %>%
+  arrange(AI_Status, time) %>%
+  mutate(
+    AI_Status = factor(
+      AI_Status, 
+      levels = c("No AI Exposure", "AI Exposure")
+    )
+  )
+
+# Save Data
+saveRDS(survival_df, file.path(path_temp, "survival_curve_25km_20_24_data.rds"))
+write.csv(survival_df, file.path(path_tables, "survival_curve_25km_20_24_data.csv"), 
+          row.names = FALSE)
+
+metadata <- list(
+  model_key = model_key,
+  var_name = var_name,
+  min_val = min_val,
+  mean_exposed = mean_exposed,
+  n_strata = length(strata_curves),
+  n_exposed = length(exposed_vals)
+)
+saveRDS(metadata, file.path(path_temp, "survival_curve_25km_20_24_metadata.rds"))
+
+```
+
+
+```{r fig_3b: marginal survival curves plot session}
+
+library(ggplot2)
+library(dplyr)
+library(grid)
+library(gtable)
+
+# style
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_CURVE <- 0.8
+LINE_WIDTH_DIFF <- 0.6
+LEGEND_KEY_SIZE <- 0.8
+
+COLOR_NO_DC <- "#360185"
+COLOR_DC <- "#DE1A58"
+COLOR_DIFF <- "#FF8C00"
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_blank(),  
+      plot.subtitle = element_blank(),  
+      plot.caption = element_blank(), 
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(t = 4)),
+      axis.text.y = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(r = 4)),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(t = 8)),
+      axis.title.y = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(r = 8)),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",  
+      plot.margin = margin(12, 40, 12, 10),
+      panel.grid = element_blank()
+    )
+}
+
+# Load Data
+survival_df <- readRDS(file.path(path_temp, "survival_curve_25km_20_24_data.rds"))
+metadata <- readRDS(file.path(path_temp, "survival_curve_25km_20_24_metadata.rds"))
+
+# Calculate Difference
+diff_df <- survival_df %>%
+  dplyr::select(time, AI_Status, Survival) %>%
+  tidyr::pivot_wider(names_from = AI_Status, values_from = Survival) %>%
+  mutate(
+    Difference = `AI Exposure` - `No AI Exposure`,
+    Rel_Diff_Pct = 100 * Difference / `No AI Exposure`
+  ) %>%
+  filter(!is.na(Difference))
+
+cat(sprintf("Calculated differences for %d time points\n", nrow(diff_df)))
+cat(sprintf("Difference range: [%.4f, %.4f]\n\n", 
+            min(diff_df$Difference), max(diff_df$Difference)))
+
+# Y-axis Range for Difference
+diff_ylim <- c(0, 0.25)
+
+# Main Plot
+survival_plot <- ggplot(survival_df, aes(x = time, y = Survival,
+                                          color = AI_Status, linetype = AI_Status)) +
+  # Survival curves
+  geom_step(linewidth = LINE_WIDTH_CURVE) +
+  
+  # Difference curve (mapped to secondary axis)
+  geom_step(data = diff_df, 
+            aes(x = time, y = (Difference - diff_ylim[1]) / diff(diff_ylim) * 1.0),
+            color = COLOR_DIFF, 
+            linetype = "dashed",
+            linewidth = LINE_WIDTH_DIFF,
+            inherit.aes = FALSE) +
+  
+  # Scales
+  scale_y_continuous(
+    name = "Survival Probability",
+    limits = c(0, 1), 
+    breaks = seq(0, 1, 0.25),
+    labels = sprintf("%.2f", seq(0, 1, 0.25)),
+    expand = c(0.01, 0),
+    sec.axis = sec_axis(
+      trans = ~ . * diff(diff_ylim) + diff_ylim[1],
+      name = "Difference",
+      breaks = seq(0, 0.25, by = 0.05),
+      labels = function(x) sprintf("%.2f", x)
+    )
+  ) +
+  
+  scale_x_continuous(
+    name = "Operating Years",
+    breaks = seq(0, max(survival_df$time), by = 10),
+    expand = c(0.02, 0)
+  ) +
+  
+  scale_color_manual(
+    values = c("No AI Exposure" = COLOR_NO_DC, 
+               "AI Exposure" = COLOR_DC)
+  ) +
+  
+  scale_linetype_manual(
+    values = c("No AI Exposure" = "solid", 
+               "AI Exposure" = "solid")
+  ) +
+  
+  # Theme
+  theme_nature_standard()
+
+# legend
+legend_x_start <- max(survival_df$time) * 0.65
+legend_y_start <- 0.95
+legend_spacing <- 0.08
+
+survival_plot_final <- survival_plot +
+  # No exposure
+  annotate("segment", 
+           x = legend_x_start, 
+           xend = legend_x_start + max(survival_df$time) * 0.05,
+           y = legend_y_start, 
+           yend = legend_y_start,
+           color = COLOR_NO_DC, 
+           linetype = "solid", 
+           linewidth = LINE_WIDTH_CURVE) +
+  annotate("text",
+           x = legend_x_start + max(survival_df$time) * 0.06,
+           y = legend_y_start,
+           label = "No exposure",
+           hjust = 0, 
+           size = 3.2, 
+           color = "black") +
+  
+  # Exposed
+  annotate("segment", 
+           x = legend_x_start, 
+           xend = legend_x_start + max(survival_df$time) * 0.05,
+           y = legend_y_start - legend_spacing, 
+           yend = legend_y_start - legend_spacing,
+           color = COLOR_DC, 
+           linetype = "solid", 
+           linewidth = LINE_WIDTH_CURVE) +
+  annotate("text",
+           x = legend_x_start + max(survival_df$time) * 0.06,
+           y = legend_y_start - legend_spacing,
+           label = "Exposed",
+           hjust = 0, 
+           size = 3.2, 
+           color = "black") +
+  
+  # Survival Difference
+  annotate("segment", 
+           x = legend_x_start, 
+           xend = legend_x_start + max(survival_df$time) * 0.05,
+           y = legend_y_start - legend_spacing * 2, 
+           yend = legend_y_start - legend_spacing * 2,
+           color = COLOR_DIFF, 
+           linetype = "dashed", 
+           linewidth = LINE_WIDTH_DIFF) +
+  annotate("text",
+           x = legend_x_start + max(survival_df$time) * 0.06,
+           y = legend_y_start - legend_spacing * 2,
+           label = "Difference",
+           hjust = 0, 
+           size = 3.2, 
+           color = "black")
+
+# Display
+print(survival_plot_final)
+
+# Save Plots
+ggsave(
+  file.path(path_figures, "fig3b.pdf"),
+  plot = survival_plot_final,
+  width = 5.5, 
+  height = 4, 
+  device = "pdf" 
+)
+
+# Detailed Year-by-Year Output
+cat("\n", paste(rep("=", 100), collapse = ""), "\n")
+cat("DETAILED YEAR-BY-YEAR SURVIVAL PROBABILITIES\n")
+cat(paste(rep("=", 100), collapse = ""), "\n\n")
+
+# Create complete year sequence
+all_years <- seq(0, max(diff_df$time), by = 1)
+
+detailed_output <- data.frame()
+
+for (year in all_years) {
+  year_data <- diff_df %>%
+    filter(time <= year) %>%
+    slice_max(time, n = 1)
+  
+  if (nrow(year_data) > 0) {
+    detailed_output <- rbind(detailed_output, data.frame(
+      Year = year,
+      Actual_Time = year_data$time,
+      No_DC = year_data$`No AI Exposure`,
+      DC_Exposed = year_data$`AI Exposure`,
+      Difference = year_data$Difference,
+      Rel_Diff_Pct = year_data$Rel_Diff_Pct
+    ))
+  }
+}
+
+# Print table
+cat(sprintf("%-6s | %-12s | %-12s | %-12s | %-12s | %-12s\n",
+            "Year", "Actual Time", "No DC Exp.", "DC Exposed", "Difference", "Rel. Diff %"))
+cat(paste(rep("-", 100), collapse = ""), "\n")
+
+for (i in 1:nrow(detailed_output)) {
+  row <- detailed_output[i, ]
+  cat(sprintf("%-6d | %-12.2f | %-12.6f | %-12.6f | %+12.6f | %+12.2f%%\n",
+              row$Year, 
+              row$Actual_Time,
+              row$No_DC,
+              row$DC_Exposed,
+              row$Difference,
+              row$Rel_Diff_Pct))
+}
+
+cat("\n", paste(rep("=", 100), collapse = ""), "\n\n")
+
+# Save Detailed Data
+write.csv(detailed_output, 
+          file.path(path_tables, "si_table4_source.csv"),
+          row.names = FALSE)
+
+```
+
+```{r fig3c}
+
+# run "cox_largerdc.Rmd"
+
+```
+
+
+```{r fig_4a-b_hetero_calculate_section}
+
+library(survival)
+library(dplyr)
+library(tidyr)
+
+# Configuration
+FOCAL_DISTANCE <- "25km"
+FOCAL_TYPE <- "20_24"
+FOCAL_VAR <- paste0("ai_proximity_", FOCAL_DISTANCE, "_", FOCAL_TYPE)
+
+# Step 1: Prepare Data with Standardized Variables
+prepare_interaction_data <- function(data) {
+  
+  data <- data %>%
+    mutate(
+      Heat_rate_Btu_per_kWh = as.numeric(as.vector(Heat_rate_Btu_per_kWh)),
+      co2_intensity = as.numeric(as.vector(co2_intensity))
+    )
+  
+  stats <- data %>%
+    summarise(
+      AI_mean = mean(.data[[FOCAL_VAR]], na.rm = TRUE),
+      AI_sd = sd(.data[[FOCAL_VAR]], na.rm = TRUE),
+      HR_mean = mean(Heat_rate_Btu_per_kWh, na.rm = TRUE),
+      HR_sd = sd(Heat_rate_Btu_per_kWh, na.rm = TRUE),
+      CO2_mean = mean(co2_intensity, na.rm = TRUE),
+      CO2_sd = sd(co2_intensity, na.rm = TRUE)
+    )
+  
+  assign("heterogeneity_stats", stats, envir = .GlobalEnv)
+  
+  focal_var_std <- paste0(FOCAL_VAR, "_std")
+  
+  data_prepared <- data %>%
+    mutate(
+      !!focal_var_std := (.data[[FOCAL_VAR]] - stats$AI_mean) / stats$AI_sd,
+      Heat_rate_Btu_per_kWh_std = (Heat_rate_Btu_per_kWh - stats$HR_mean) / stats$HR_sd,
+      co2_intensity_std = (co2_intensity - stats$CO2_mean) / stats$CO2_sd,
+      AI_x_Heat_rate_Btu_per_kWh_std = .data[[focal_var_std]] * Heat_rate_Btu_per_kWh_std,
+      AI_x_co2_intensity_std = .data[[focal_var_std]] * co2_intensity_std
+    )
+  
+  return(data_prepared)
+}
+
+# Step 2: Define Interaction Models
+run_interaction_model <- function(data, interaction_var, interaction_name) {
+  
+  interaction_term <- paste0("AI_x_", interaction_var)
+  focal_var_std <- paste0(FOCAL_VAR, "_std")
+  
+  df <- data %>%
+    filter(!is.na(.data[[interaction_var]]) & is.finite(.data[[interaction_var]]))
+  
+  cat(sprintf("Sample: N=%d observations\n", nrow(df)))
+  
+  other_proximity_vars <- paste0("ai_proximity_", FOCAL_DISTANCE, "_", 
+                                 c("before06", "06_15", "16_19"))
+  
+  main_effects <- c(
+    other_proximity_vars,
+    focal_var_std,
+    interaction_var,
+    "Capacity_MW",
+    "Start_year",
+    "Heat_rate_Btu_per_kWh",
+    "Emission_factor_kg_of_CO2_per_TJ",
+    "rGDP_pc"
+  )
+  
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    paste(main_effects, collapse = " + "),
+    " + ", interaction_term,
+    " + strata(Alpha_3_code)"
+  )
+  
+  cat("\nModel Formula:\n")
+  cat(formula_str, "\n\n")
+  
+  tryCatch({
+    
+    cox_model <- coxph(
+      as.formula(formula_str),
+      data = df,
+      cluster = GEM_unit_phase_ID,
+      ties = "efron",
+      control = coxph.control(iter.max = 200)
+    )
+    
+    coef_summary <- summary(cox_model)$coefficients
+    
+    main_row <- which(rownames(coef_summary) == focal_var_std)
+    int_row <- which(rownames(coef_summary) == interaction_term)
+    mod_row <- which(rownames(coef_summary) == interaction_var)
+    
+    se_col <- ifelse("robust se" %in% colnames(coef_summary), "robust se", "se(coef)")
+    
+    main_coef <- coef_summary[main_row, "coef"]
+    main_se <- coef_summary[main_row, se_col]
+    main_pval <- coef_summary[main_row, "Pr(>|z|)"]
+    
+    int_coef <- coef_summary[int_row, "coef"]
+    int_se <- coef_summary[int_row, se_col]
+    int_pval <- coef_summary[int_row, "Pr(>|z|)"]
+    
+    mod_coef <- if(length(mod_row) > 0) coef_summary[mod_row, "coef"] else NA
+    mod_se <- if(length(mod_row) > 0) coef_summary[mod_row, se_col] else NA
+    mod_pval <- if(length(mod_row) > 0) coef_summary[mod_row, "Pr(>|z|)"] else NA
+    
+    get_sig <- function(p) {
+      case_when(
+        p < 0.001 ~ "***",
+        p < 0.01 ~ "**",
+        p < 0.05 ~ "*",
+        p < 0.1 ~ "+",
+        TRUE ~ ""
+      )
+    }
+    
+    main_sig <- get_sig(main_pval)
+    int_sig <- get_sig(int_pval)
+    
+    me_at_mean <- main_coef
+    me_at_plus1sd <- main_coef + int_coef
+    me_at_minus1sd <- main_coef - int_coef
+    
+    cat("\n----------------------------------------\n")
+    cat("Results:\n")
+    cat("----------------------------------------\n")
+    cat(sprintf("Main Effect (AI, standardized):     β=%.4f (SE=%.4f), HR=%.3f, p=%.4f %s\n",
+                main_coef, main_se, exp(main_coef), main_pval, main_sig))
+    cat(sprintf("Moderator Effect (%s, std):         β=%.4f (SE=%.4f), HR=%.3f, p=%.4f\n",
+                interaction_name, mod_coef, mod_se, exp(mod_coef), mod_pval))
+    cat(sprintf("Interaction (AI × %s):              β=%.4f (SE=%.4f), p=%.4f %s\n",
+                interaction_name, int_coef, int_se, int_pval, int_sig))
+    cat("\nMarginal Effects of AI (per 1 SD increase):\n")
+    cat(sprintf("  When Moderator at Mean (Z=0):      β=%.4f, HR=%.3f\n", 
+                me_at_mean, exp(me_at_mean)))
+    cat(sprintf("  When Moderator at Mean+1SD (Z=+1): β=%.4f, HR=%.3f\n", 
+                me_at_plus1sd, exp(me_at_plus1sd)))
+    cat(sprintf("  When Moderator at Mean-1SD (Z=-1): β=%.4f, HR=%.3f\n", 
+                me_at_minus1sd, exp(me_at_minus1sd)))
+    cat("----------------------------------------\n")
+    
+    n_obs <- cox_model$n
+    n_retirements <- cox_model$nevent
+    model_rows <- as.numeric(names(cox_model$residuals))
+    df_actual <- df[model_rows, ]
+    n_units <- n_distinct(df_actual$GEM_unit_phase_ID)
+    n_countries <- n_distinct(df_actual$Alpha_3_code)
+    
+    return(data.frame(
+      Moderator = interaction_name,
+      N_Observations = n_obs,
+      N_units = n_units,
+      N_Countries = n_countries,
+      N_Retirements = n_retirements,
+      Main_Coef = main_coef,
+      Main_SE = main_se,
+      Main_HR = exp(main_coef),
+      Main_P = main_pval,
+      Main_Sig = main_sig,
+      Moderator_Coef = mod_coef,
+      Moderator_SE = mod_se,
+      Moderator_HR = exp(mod_coef),
+      Moderator_P = mod_pval,
+      Interaction_Coef = int_coef,
+      Interaction_SE = int_se,
+      Interaction_P = int_pval,
+      Interaction_Sig = int_sig,
+      ME_at_Mean = me_at_mean,
+      ME_at_Mean_HR = exp(me_at_mean),
+      ME_at_Plus1SD = me_at_plus1sd,
+      ME_at_Plus1SD_HR = exp(me_at_plus1sd),
+      ME_at_Minus1SD = me_at_minus1sd,
+      ME_at_Minus1SD_HR = exp(me_at_minus1sd),
+      stringsAsFactors = FALSE
+    ))
+    
+  }, error = function(e) {
+    cat(sprintf("✗ Error: %s\n", e$message))
+    return(NULL)
+  })
+}
+
+# Step 3: Run
+data_prepared <- prepare_interaction_data(data)
+
+moderators <- list(
+  list(var = "co2_intensity_std", name = "CO2 Intensity"),
+  list(var = "Heat_rate_Btu_per_kWh_std", name = "Heat Rate")
+)
+
+all_results <- lapply(moderators, function(mod) {
+  run_interaction_model(data_prepared, mod$var, mod$name)
+})
+
+results_interaction <- bind_rows(all_results[!sapply(all_results, is.null)])
+
+# Step 4: Format and Save Results
+results_formatted <- results_interaction %>%
+  mutate(
+    Moderator = factor(Moderator, levels = c("CO2 Intensity", "Heat Rate"))
+  ) %>%
+  arrange(Moderator) %>%
+  mutate(
+    `DCE2020-2024 Coef. [95% CI]` = sprintf(
+      "%.4f%s [%.4f, %.4f]",
+      Main_Coef, Main_Sig,
+      Main_Coef - 1.96 * Main_SE,
+      Main_Coef + 1.96 * Main_SE
+    ),
+    `HR [95% CI]` = sprintf(
+      "%.3f [%.3f, %.3f]",
+      Main_HR,
+      exp(Main_Coef - 1.96 * Main_SE),
+      exp(Main_Coef + 1.96 * Main_SE)
+    ),
+    `Interact term [95% CI]` = sprintf(
+      "%.4f%s [%.4f, %.4f]",
+      Interaction_Coef, Interaction_Sig,
+      Interaction_Coef - 1.96 * Interaction_SE,
+      Interaction_Coef + 1.96 * Interaction_SE
+    ),
+    `Interact p-value` = sprintf("%.4f", Interaction_P)
+  ) %>%
+  dplyr::select(
+    Moderator,
+    `DCE2020-2024 Coef. [95% CI]`,
+    `HR [95% CI]`,
+    `Interact term [95% CI]`,
+    `Interact p-value`,
+    N_Observations,
+    N_units,
+    N_Retirements
+  ) %>%
+  rename(
+    `Moderating Variable` = Moderator,
+    `N (Obs.)` = N_Observations,
+    `N (Units)` = N_units,
+    `N (Retired)` = N_Retirements
+  )
+
+print(results_formatted, row.names = FALSE)
+
+saveRDS(results_interaction, file.path(path_temp, "heterogeneity_interaction_results.rds"))
+write.csv(
+  results_formatted,
+  file.path(path_tables, "si_table5_source.csv"),
+  row.names = FALSE
+)
+
+```
+
+
+
+```{r fig_4a-b: plot section}
+
+library(ggplot2)
+library(dplyr)
+library(patchwork)
+library(scales)
+
+COLOR_HIGH <- "#B8001F"    # Mean+1SD
+COLOR_MEAN <- "#FF4500"    # Mean
+COLOR_LOW <- "#48CFCB"     # Mean-1SD
+
+theme_nature <- theme_minimal(base_size = 10, base_family = "sans") +
+  theme(
+
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    
+    axis.line.x = element_line(color = "black", linewidth = 0.5),
+    axis.line.y = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.3),
+    axis.text = element_text(color = "black", size = 9),
+    axis.text.x = element_text(margin = margin(t = 4)),
+    axis.text.y = element_text(margin = margin(r = 4)),
+    axis.title = element_text(color = "black", size = 10),
+    axis.title.x = element_text(margin = margin(t = 8)),
+    axis.title.y = element_text(margin = margin(r = 8)),
+    
+    legend.position = "bottom",
+    legend.title = element_blank(),
+    legend.text = element_text(size = 9),
+    legend.key.size = unit(0.8, "lines"),
+    legend.background = element_blank(),
+    
+    plot.title = element_text(size = 11, hjust = 0),
+    plot.subtitle = element_text(size = 9, color = "grey30", hjust = 0),
+    
+    plot.margin = margin(10, 10, 10, 10)
+  )
+
+
+create_moderation_plot <- function(moderator_name, 
+                                  main_coef, 
+                                  interaction_coef,
+                                  main_se,
+                                  interaction_se,
+                                  moderator_label = NULL,
+                                  use_expression = FALSE, 
+                                  show_legend = TRUE) {
+  
+  if (is.null(moderator_label)) moderator_label <- moderator_name
+  
+  # caculate marginal effects
+  z_values <- seq(-2, 2, by = 0.1)
+  
+  marginal_effects <- data.frame(
+    z = z_values,
+    beta = main_coef + interaction_coef * z_values
+  ) %>%
+    mutate(
+      se = sqrt(main_se^2 + (z * interaction_se)^2),
+      hr = exp(beta),
+      hr_lower = exp(beta - 1.96 * se),
+      hr_upper = exp(beta + 1.96 * se)
+    )
+  
+  key_points <- data.frame(
+    z = c(-1, 0, 1),
+    label = factor(c("Mean-1SD (Low)", "Mean", "Mean+1SD (High)"),
+                  levels = c("Mean-1SD (Low)", "Mean", "Mean+1SD (High)"))
+  ) %>%
+    mutate(
+      beta = main_coef + interaction_coef * z,
+      se = sqrt(main_se^2 + (z * interaction_se)^2),
+      hr = exp(beta),
+      hr_lower = exp(beta - 1.96 * se),
+      hr_upper = exp(beta + 1.96 * se)
+    )
+  
+  # sig
+  interaction_p <- 2 * (1 - pnorm(abs(interaction_coef / interaction_se)))
+  
+  subtitle_text <- sprintf(
+    "Interaction: Coef = %.3f, SE = %.3f, p %s",
+    interaction_coef,
+    interaction_se,
+    ifelse(interaction_p < 0.001, "< 0.001",
+           ifelse(interaction_p < 0.01, "< 0.01",
+                  ifelse(interaction_p < 0.05, "< 0.05",
+                         sprintf("= %.3f", interaction_p))))
+  )
+  
+  p <- ggplot(marginal_effects, aes(x = z, y = hr)) +
+    
+    # reference line (HR = 1)
+    geom_hline(yintercept = 1, linetype = "dashed", color = "grey50", linewidth = 0.5) +
+    
+    # ci
+    geom_ribbon(aes(ymin = hr_lower, ymax = hr_upper), 
+                alpha = 0.15, fill = "grey50") +
+    
+    # line
+    geom_line(linewidth = 0.8, color = "black") +
+    
+    # points
+    geom_point(data = key_points, 
+               aes(x = z, y = hr, color = label),
+               size = 3, shape = 21, fill = "white", stroke = 1.2) +
+    
+    # error bar
+    geom_errorbar(data = key_points,
+                  aes(x = z, ymin = hr_lower, ymax = hr_upper, color = label),
+                  width = 0.1, linewidth = 0.6) +
+    
+    # color
+    scale_color_manual(values = c(
+      "Mean-1SD (Low)" = COLOR_LOW,
+      "Mean" = COLOR_MEAN,
+      "Mean+1SD (High)" = COLOR_HIGH
+    )) +
+    
+    # X-axis
+    scale_x_continuous(
+      breaks = c(-2, -1, 0, 1, 2),
+      labels = c("-2SD", "-1SD", "Mean", "+1SD", "+2SD")
+    ) +
+    
+    # Y-axis
+    scale_y_continuous(
+      breaks = seq(0.2, 1.6, by = 0.2),
+      labels = sprintf("%.1f", seq(0.2, 1.6, by = 0.2)),
+      limits = c(0.2, 1.6)
+    ) +
+    
+    theme_nature +
+    theme(
+      legend.position = c(0.05, 0.05),
+      legend.justification = c(0, 0),
+      legend.direction = "horizontal",
+      legend.text = element_text(size = 7),
+      legend.key.size = unit(0.6, "lines"),
+      legend.background = element_blank(),
+      legend.margin = margin(4, 4, 4, 4)
+    )
+  
+  if (use_expression) {
+    p <- p + labs(
+      title = moderator_name,
+      subtitle = subtitle_text,
+      x = moderator_label,  
+      y = "Hazard Ratio"
+    )
+  } else {
+    p <- p + labs(
+      title = moderator_name,
+      subtitle = subtitle_text,
+      x = paste0(moderator_label, " (Standardized)"),
+      y = "Hazard Ratio"
+    )
+  }
+  
+  return(p)
+}
+
+# Generate Plots
+
+results <- results_interaction
+
+# Plot 1: CO2 Intensity
+p1 <- create_moderation_plot(
+  moderator_name = expression(CO[2]~Intensity),  
+  main_coef = results$Main_Coef[results$Moderator == "CO2 Intensity"],
+  interaction_coef = results$Interaction_Coef[results$Moderator == "CO2 Intensity"],
+  main_se = results$Main_SE[results$Moderator == "CO2 Intensity"],
+  interaction_se = results$Interaction_SE[results$Moderator == "CO2 Intensity"],
+  moderator_label = expression(CO[2]~Intensity~(kg~CO[2]/kWh)~(Standardized)),  
+  use_expression = TRUE,  
+  show_legend = TRUE
+)
+
+# Plot 2: Heat Rate
+p2 <- create_moderation_plot(
+  moderator_name = "Heat Rate",
+  main_coef = results$Main_Coef[results$Moderator == "Heat Rate"],
+  interaction_coef = results$Interaction_Coef[results$Moderator == "Heat Rate"],
+  main_se = results$Main_SE[results$Moderator == "Heat Rate"],
+  interaction_se = results$Interaction_SE[results$Moderator == "Heat Rate"],
+  moderator_label = "Heat Rate (Btu/kWh)",
+  use_expression = FALSE,  
+  show_legend = TRUE
+)
+
+ggsave(
+  filename = file.path(path_figures, "fig4a.pdf"),
+  plot = p1,
+  width = 3.5,
+  height = 3.5,
+  units = "in",
+  dpi = 300
+)
+
+ggsave(
+  filename = file.path(path_figures, "fig4b.pdf"),
+  plot = p2,
+  width = 3.5,
+  height = 3.5,
+  units = "in",
+  dpi = 300
+)
+
+# Summary Table
+
+summary_table <- results_interaction %>%
+  mutate(
+    ME_Change = sprintf("%.3f → %.3f → %.3f", 
+                       ME_at_Minus1SD_HR, ME_at_Mean_HR, ME_at_Plus1SD_HR),
+    Direction = case_when(
+      Interaction_P < 0.05 & Interaction_Coef < 0 ~ "Strengthens delay (Low→High moderator)",
+      Interaction_P < 0.05 & Interaction_Coef > 0 ~ "Weakens delay (Low→High moderator)",
+      TRUE ~ "No significant moderation"
+    )
+  ) %>%
+  dplyr::select(Moderator, Interaction_Coef, Interaction_SE, Interaction_P, ME_Change, Direction)
+
+
+print(summary_table, row.names = FALSE)
+
+write.csv(summary_table, 
+          file.path(path_tables, "heterogeneity_moderation_summary.csv"),
+          row.names = FALSE)
+
+```
+
+```{r fig_4c: hetero_calculation_section}
+library(survival)
+library(dplyr)
+library(tidyr)
+
+# Configuration
+FOCAL_DISTANCE <- "25km"
+FOCAL_TYPE <- "20_24"
+FOCAL_VAR <- paste0("ai_proximity_", FOCAL_DISTANCE, "_", FOCAL_TYPE)
+
+prepare_emission_group_data <- function(data) {
+  data %>%
+    mutate(
+      Emission_factor_kg_of_CO2_per_TJ = as.numeric(as.vector(Emission_factor_kg_of_CO2_per_TJ)),
+      EF_Group = case_when(
+        Emission_factor_kg_of_CO2_per_TJ == 94600 ~ "Bituminous",
+        Emission_factor_kg_of_CO2_per_TJ == 96100 ~ "Sub-bituminous",
+        Emission_factor_kg_of_CO2_per_TJ == 98300 ~ "Anthracite",
+        Emission_factor_kg_of_CO2_per_TJ == 101000 ~ "Lignite",
+        TRUE ~ NA_character_
+      ),
+      EF_Group = factor(
+        EF_Group,
+        levels = c("Bituminous", "Sub-bituminous", "Anthracite", "Lignite")
+      )
+    ) %>%
+    filter(!is.na(EF_Group)) %>%
+    mutate(EF_Group = relevel(EF_Group, ref = "Lignite"))
+}
+
+run_emission_group_interaction_model <- function(data) {
+  
+  df <- data %>%
+    filter(!is.na(EF_Group))
+  
+  other_proximity_vars <- paste0("ai_proximity_", FOCAL_DISTANCE, "_",
+                                 c("before06", "06_15", "16_19"))
+  
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    paste(other_proximity_vars, collapse = " + "),
+    " + ", FOCAL_VAR,
+    " * EF_Group",
+    " + Capacity_MW",
+    " + Start_year",
+    " + Heat_rate_Btu_per_kWh",
+    " + rGDP_pc",
+    " + strata(Alpha_3_code)"
+  )
+  
+  cat("\nModel Formula:\n")
+  cat(formula_str, "\n\n")
+  
+  cox_model <- coxph(
+    as.formula(formula_str),
+    data = df,
+    cluster = GEM_unit_phase_ID,
+    ties = "efron",
+    control = coxph.control(iter.max = 200)
+  )
+  
+  used_rows <- as.numeric(rownames(model.frame(cox_model)))
+  df_actual <- df[used_rows, , drop = FALSE]
+  
+  n_obs <- nrow(df_actual)
+  n_retirements <- sum(df_actual$retire, na.rm = TRUE)
+  n_units <- n_distinct(df_actual$GEM_unit_phase_ID)
+  
+  b <- coef(cox_model)
+  V <- vcov(cox_model)
+  coef_names <- names(b)
+  
+  base_name <- FOCAL_VAR
+  if (!(base_name %in% coef_names)) {
+    stop(sprintf("Base coefficient %s not found.", base_name))
+  }
+  
+  ref_group <- "Lignite"
+  groups <- levels(df$EF_Group)
+  results_list <- list()
+  
+  for (g in groups) {
+    
+    if (g == ref_group) {
+      diff_coef <- 0
+      diff_se <- NA
+      diff_p <- NA
+      ci_lower <- NA
+      ci_upper <- NA
+    } else {
+      int_name1 <- paste0(FOCAL_VAR, ":EF_Group", g)
+      int_name2 <- paste0("EF_Group", g, ":", FOCAL_VAR)
+      int_name <- if (int_name1 %in% coef_names) int_name1 else int_name2
+      
+      if (!(int_name %in% coef_names)) {
+        stop(sprintf("Interaction term for group %s not found.", g))
+      }
+      
+      L_diff <- rep(0, length(b))
+      names(L_diff) <- coef_names
+      L_diff[int_name] <- 1
+      
+      diff_coef <- sum(L_diff * b)
+      diff_se <- sqrt(as.numeric(t(L_diff) %*% V %*% L_diff))
+      diff_z <- diff_coef / diff_se
+      diff_p <- 2 * (1 - pnorm(abs(diff_z)))
+      ci_lower <- diff_coef - 1.96 * diff_se
+      ci_upper <- diff_coef + 1.96 * diff_se
+    }
+    
+    results_list[[g]] <- data.frame(
+      EF_Group = g,
+      N_Observations = n_obs,
+      N_Units = n_units,
+      N_Retirements = n_retirements,
+      Interaction_Coef = diff_coef,
+      Interaction_SE = diff_se,
+      Interaction_CI_Lower = ci_lower,
+      Interaction_CI_Upper = ci_upper,
+      Interaction_P = diff_p,
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  results_df <- bind_rows(results_list)
+  
+  return(list(
+    model = cox_model,
+    vcov = V,
+    results = results_df
+  ))
+}
+
+# Run
+data_emission_group <- prepare_emission_group_data(data)
+emission_group_output <- run_emission_group_interaction_model(data_emission_group)
+
+results_emission_group <- emission_group_output$results
+
+results_emission_group_table <- results_emission_group %>%
+  mutate(
+    `Interaction coef. [95% CI]` = case_when(
+      EF_Group == "Lignite" ~ "Reference",
+      TRUE ~ sprintf("%.4f [%.4f, %.4f]",
+                     Interaction_Coef,
+                     Interaction_CI_Lower,
+                     Interaction_CI_Upper)
+    ),
+    `p-value` = case_when(
+      EF_Group == "Lignite" ~ "",
+      TRUE ~ sprintf("%.4f", Interaction_P)
+    )
+  ) %>%
+  dplyr::select(
+    `Emission Factor Group` = EF_Group,
+    `Interaction coef. [95% CI]`,
+    `p-value`,
+    `N (Observations)` = N_Observations,
+    `N (Units)` = N_Units,
+    `N (Retirements)` = N_Retirements
+  )
+
+write.csv(
+  results_emission_group_table,
+  file = file.path(path_tables, "si_table6_source.csv"),
+  row.names = FALSE
+)
+
+print(results_emission_group_table, row.names = FALSE)
+
+
+```
+
+```{r fig_4c: hetero_plot_section}
+library(dplyr)
+library(ggplot2)
+library(grid)
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LABEL <- 8
+FONT_SIZE_NOTE <- 8.5
+FONT_SIZE_HEADER <- 10
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 2.8
+POINT_STROKE <- 1.0
+
+MAIN_COLOR <- "#FF4500"
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(
+        size = FONT_SIZE_HEADER,
+        hjust = 0,
+        margin = margin(b = 6)
+      ),
+      plot.subtitle = element_blank(),
+      plot.caption = element_blank(),
+      axis.text.x = element_text(
+        size = FONT_SIZE_AXIS_TEXT,
+        color = "black",
+        margin = margin(t = 4)
+      ),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT,
+        color = "black",
+        hjust = 1,
+        margin = margin(r = 6)
+      ),
+      axis.title.x = element_text(
+        size = FONT_SIZE_AXIS_TITLE,
+        margin = margin(t = 8)
+      ),
+      axis.title.y = element_blank(),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none",
+      plot.margin = margin(8, 18, 10, 20),
+      panel.grid = element_blank()
+    )
+}
+
+group_order <- c("Bituminous", "Sub-bituminous", "Anthracite")
+
+plot_data <- results_emission_group %>%
+  filter(EF_Group != "Lignite") %>%
+  mutate(
+    EF_Group = factor(EF_Group, levels = group_order),
+    EF_Label = as.character(EF_Group),
+    y = c(length(group_order):1),
+    Interaction_Coef = Interaction_Coef,
+    Interaction_CI_Lower = Interaction_CI_Lower,
+    Interaction_CI_Upper = Interaction_CI_Upper,
+    Coef_Label = sprintf("%.2f", Interaction_Coef)
+  ) %>%
+  arrange(EF_Group)
+
+x_min <- min(plot_data$Interaction_CI_Lower, na.rm = TRUE) - 1
+x_max <- max(plot_data$Interaction_CI_Upper, na.rm = TRUE) + 1
+
+p <- ggplot(plot_data, aes(x = Interaction_Coef, y = y)) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "dashed",
+    color = "grey50",
+    linewidth = LINE_WIDTH_AXIS
+  ) +
+  geom_errorbarh(
+    aes(xmin = Interaction_CI_Lower, xmax = Interaction_CI_Upper),
+    height = 0,
+    linewidth = LINE_WIDTH_ERROR,
+    color = MAIN_COLOR
+  ) +
+  geom_point(
+    shape = 21,
+    size = POINT_SIZE,
+    stroke = POINT_STROKE,
+    color = MAIN_COLOR,
+    fill = "white"
+  ) +
+  geom_text(
+    aes(label = Coef_Label),
+    nudge_y = 0.18,
+    size = FONT_SIZE_LABEL / .pt,
+    color = "black",
+    family = FONT_FAMILY,
+    vjust = 0,
+    hjust = 0.5
+  ) +
+  scale_x_continuous(
+    limits = c(x_min, x_max),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = plot_data$y,
+    labels = plot_data$EF_Label,
+    expand = expansion(add = c(0.25, 0.20))
+  ) +
+  labs(
+    title = "Coal Type (Lignite as baseline group)",
+    x = "Interaction Coefficient (95% CI)",
+    y = NULL
+  ) +
+  coord_cartesian(clip = "off") +
+  theme_nature_standard()
+
+print(p)
+
+ggsave(
+  filename = file.path(path_figures, "fig4c.pdf"),
+  plot = p,
+  width = 4,
+  height = 2.55,
+  units = "in",
+  dpi = 600,
+  device = "pdf"
+)
+
+```
+
+
+
+```{r figure 5a: aft model plot session}
+
+library(ggplot2)
+library(dplyr)
+library(grid)
+library(gtable)
+library(haven)
+
+# Hard-coded Results from Stata 
+
+results_25km <- data.frame(
+  Type = c("before06", "06_15", "16_19", "20_24"),
+  Coefficient = c(-0.0009005, -0.0010958, -0.0007482, 0.020806),
+  SE = c(0.0017908, 0.0014951, 0.0012386, 0.0052207),
+  P_value = c(0.615, 0.464, 0.546, 0.000),
+  stringsAsFactors = FALSE
+)
+
+# Calculate Acceleration Factor (exp(coef))
+
+results_25km <- results_25km %>%
+  mutate(
+    AF = exp(Coefficient),  # Acceleration Factor
+    AF_lower = exp(Coefficient - 1.96 * SE),
+    AF_upper = exp(Coefficient + 1.96 * SE),
+    Sig = case_when(
+      P_value < 0.001 ~ "***",
+      P_value < 0.01 ~ "**",
+      P_value < 0.05 ~ "*",
+      P_value < 0.1 ~ "+",
+      TRUE ~ ""
+    ),
+    Type_clean = case_when(
+      Type == "before06" ~ "Before 2006",
+      Type == "06_15" ~ "2006-2015",
+      Type == "16_19" ~ "2016-2019",
+      Type == "20_24" ~ "2020-2024",
+      TRUE ~ Type
+    ),
+    plot_order = case_when(
+      Type_clean == "Before 2006" ~ 4,
+      Type_clean == "2006-2015" ~ 3,
+      Type_clean == "2016-2019" ~ 2,
+      Type_clean == "2020-2024" ~ 1,
+      TRUE ~ NA_real_
+    )
+  )
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 11
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 10
+FONT_SIZE_AXIS_TITLE <- 11
+FONT_SIZE_LEGEND <- 10
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.8
+LINE_WIDTH_ERROR <- 1.0
+POINT_SIZE <- 2.2
+POINT_STROKE <- 1.0
+
+FIXED_YTITLE_WIDTH <- unit(1.1, "cm")
+FIXED_YAXIS_WIDTH <- unit(1.9, "cm")
+
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15" = "#4169E1",
+  "16_19" = "#9E1C60",
+  "20_24" = "#FF4500"
+)
+
+period_labels <- c(
+  "before06" = "Before 2006",
+  "06_15" = "2006-2015",
+  "16_19" = "2016-2019",
+  "20_24" = "2020-2024"
+)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(size = FONT_SIZE_TITLE, hjust = 0, 
+                                margin = margin(b = 8)),
+      plot.subtitle = element_text(size = FONT_SIZE_AXIS_TITLE, hjust = 0, 
+                                    margin = margin(b = 8)),
+      plot.caption = element_text(size = FONT_SIZE_CAPTION, hjust = 0, 
+                                  color = "grey20", margin = margin(t = 8), 
+                                  lineheight = 1.1),
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black",
+                                 margin = margin(t = 4)),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT, 
+        color = "black",
+        hjust = 1.1,              
+        vjust = 1.1,              
+        angle = -30,              
+        margin = margin(r = 4)
+      ),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, 
+                                  margin = margin(t = 8)),
+      axis.title.y = element_text(
+        size = FONT_SIZE_AXIS_TITLE, 
+        angle = 90,              
+        margin = margin(r = 8)
+      ),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.y = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none", 
+      plot.margin = margin(12, 40, 12, 20), 
+      panel.grid = element_blank()
+    )
+}
+
+# Calculate label positions
+
+x_min <- min(results_25km$AF_lower, na.rm = TRUE)
+x_max <- max(results_25km$AF_upper, na.rm = TRUE)
+x_range <- x_max - x_min
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.30 * x_range
+
+results_25km <- results_25km %>%
+  mutate(
+    label_x = pmin(AF_upper + 0.03 * x_range, x_limit_max - 0.10 * x_range),
+    af_label = sprintf("%.3f%s", AF, Sig)
+  )
+
+# plot
+
+forest_plot_25km_af <- ggplot(results_25km, aes(x = AF, y = plot_order)) +
+  geom_vline(xintercept = 1, linetype = "solid", 
+             color = "black", linewidth = LINE_WIDTH_AXIS) +
+  geom_errorbarh(aes(xmin = AF_lower, xmax = AF_upper, color = Type), 
+                 height = 0, linewidth = LINE_WIDTH_ERROR) +
+  geom_point(aes(color = Type, fill = Type), 
+             shape = 21, size = POINT_SIZE, stroke = POINT_STROKE) +
+  geom_text(aes(x = label_x, label = af_label, color = Type), 
+            hjust = 0, size = FONT_SIZE_AXIS_TEXT * 0.35, fontface = "bold",
+            show.legend = FALSE, family = FONT_FAMILY) +
+  scale_color_manual(
+    values = nature_colors, 
+    labels = period_labels,
+    breaks = period_order
+  ) +
+  scale_fill_manual(
+    values = c("before06" = "white", "06_15" = "white", 
+               "16_19" = "white", "20_24" = "white"),
+    guide = "none"
+  ) +
+  labs(
+    x = "Acceleration Factor (95% CI)",
+    y = "Data center construction periods"
+  ) +
+  theme_nature_standard() +
+  scale_x_continuous(
+    limits = c(0.985, 1.041),
+    breaks = c(0.99, 1.00, 1.01, 1.02, 1.03, 1.04),
+    labels = scales::label_number(accuracy = 0.001),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:4,
+    labels = c("2020-2024", "2016-2019", "2006-2015", "Before 2006"),
+    expand = expansion(add = c(0.5, 0.5))
+  )
+
+
+plot_grob <- ggplotGrob(forest_plot_25km_af)
+plot_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  filename = file.path(path_figures, "fig5a.pdf"),
+  plot = plot_grob,
+  width = 6.5,
+  height = 4,
+  units = "in",
+  device = "pdf"
+)
+
+print(forest_plot_25km_af)
+
+
+summary_table <- results_25km %>%
+  dplyr::select(Type_clean, AF, AF_lower, AF_upper, P_value, Sig) %>%
+  arrange(desc(Type_clean))
+
+print(summary_table, row.names = FALSE)
+
+# Prepare export table with all relevant information
+export_table <- results_25km %>%
+  arrange(desc(Type_clean)) %>%
+  dplyr::select(
+    Period = Type_clean,
+    Coefficient,
+    SE,
+    AF,
+    AF_lower,
+    AF_upper,
+    P_value,
+    Significance = Sig
+  ) %>%
+  mutate(
+    N_subjects = 9379,
+    N_obs = 259044,
+    N_failures = 2913
+  )
+
+# Save to CSV
+write.csv(
+  export_table,
+  file = file.path(path_tables, "si_table7_source.csv"),
+  row.names = FALSE
+)
+```
+
+
+```{r supplementary fig 4: plot_placebo: random permutation: calculation session}
+library(survival)
+library(dplyr)
+library(parallel)
+library(ggplot2)
+
+set.seed(123)
+
+dist <- "25km"
+proximity_vars <- paste0("ai_proximity_", dist, "_", c("before06", "06_15", "16_19", "20_24"))
+
+formula_str <- paste0(
+  "Surv(time0, time1, retire) ~ ",
+  paste(proximity_vars, collapse = " + "),
+  " + Capacity_MW + Start_year + Emission_factor_kg_of_CO2_per_TJ",
+  " + Heat_rate_Btu_per_kWh + rGDP_pc + strata(Alpha_3_code)"
+)
+
+target_var   <- "ai_proximity_25km_20_24"
+id_var       <- "GEM_unit_phase_ID"
+
+# real model
+
+cox_true <- coxph(
+  as.formula(formula_str),
+  data = data,
+  cluster = data[[id_var]],
+  ties = "efron"
+)
+
+true_coef <- unname(coef(cox_true)[target_var])
+true_se <- summary(cox_true)$coefficients[target_var, "se(coef)"]
+true_pval <- summary(cox_true)$coefficients[target_var, "Pr(>|z|)"]
+true_hr <- exp(true_coef)
+
+
+# random permute
+
+placebo_iteration_full_sample <- function(i, data, target_var, 
+                                          id_var, formula_str) {
+  set.seed(100000 + i)
+  
+  df <- data
+  
+  idx_non_na <- !is.na(df[[target_var]])
+  
+  if (sum(idx_non_na) > 0) {
+    values_to_shuffle <- df[[target_var]][idx_non_na]
+    shuffled_values <- sample(values_to_shuffle, length(values_to_shuffle), replace = FALSE)
+    df[[target_var]][idx_non_na] <- shuffled_values
+  }
+  
+  # run cox
+  tryCatch({
+    cox_placebo <- coxph(
+      as.formula(formula_str),
+      data = df,
+      cluster = df[[id_var]],
+      ties = "efron"
+    )
+    
+    coef_val <- unname(coef(cox_placebo)[target_var])
+    se_val <- summary(cox_placebo)$coefficients[target_var, "se(coef)"]
+    pval_val <- summary(cox_placebo)$coefficients[target_var, "Pr(>|z|)"]
+    
+    return(c(iter = i, coef = coef_val, se = se_val, pval = pval_val))
+    
+  }, error = function(e) {
+    return(c(iter = i, coef = NA, se = NA, pval = NA))
+  })
+}
+
+# 500 times
+
+n_iter <- 500
+n_cores <- min(detectCores() - 1, 8)
+
+cl <- makeCluster(n_cores)
+
+clusterExport(cl, c("data", "target_var", "id_var", "formula_str",
+                    "placebo_iteration_full_sample"),
+              envir = environment())
+
+invisible(clusterEvalQ(cl, {
+  library(survival)
+  library(dplyr)
+}))
+
+start_time <- Sys.time()
+placebo_list <- parLapply(
+  cl, 1:n_iter,
+  function(i) placebo_iteration_full_sample(
+    i = i, data = data, target_var = target_var, 
+    id_var = id_var, formula_str = formula_str
+  )
+)
+end_time <- Sys.time()
+
+stopCluster(cl)
+rm(cl)
+gc()
+
+time_elapsed <- as.numeric(difftime(end_time, start_time, units = "secs"))
+
+# results
+
+placebo_df <- do.call(rbind, placebo_list) %>% 
+  as.data.frame() %>%
+  filter(!is.na(coef))
+
+colnames(placebo_df) <- c("iter", "coef", "se", "pval")
+
+placebo_mean <- mean(placebo_df$coef)
+placebo_sd <- sd(placebo_df$coef)
+
+# sig check
+placebo_p_1sided <- mean(placebo_df$coef <= true_coef)
+
+z_score <- (true_coef - placebo_mean) / placebo_sd
+pval_less_005 <- mean(placebo_df$pval < 0.05)
+
+saveRDS(placebo_df, file.path(path_temp, "placebo_results_full_sample_500.rds"))
+write.csv(placebo_df, file.path(path_tables, "placebo_results_full_sample_500.csv"), 
+          row.names = FALSE)
+
+```
+
+
+```{r supplementary fig 5: plot_placebo: random permutation: plot session}
+
+library(ggplot2)
+library(dplyr)
+
+# Calculate key statistics
+placebo_mean <- mean(placebo_df$coef)
+placebo_sd <- sd(placebo_df$coef)
+placebo_p_1sided <- mean(placebo_df$coef <= true_coef)
+z_score <- (true_coef - placebo_mean) / placebo_sd
+
+# 1. Calculate kernel density estimation
+density_placebo <- density(placebo_df$coef, adjust = 1.1, na.rm = TRUE)
+density_df <- data.frame(
+  x = density_placebo$x,
+  y = density_placebo$y
+)
+
+# 2. Trim density curve tails
+y_threshold <- max(density_df$y) * 0.01
+density_df <- density_df %>%
+  filter(y >= y_threshold)
+
+# 3. Color scheme
+color_density <- "#7A0019"
+color_null <- "grey35"
+
+# 4. Optimize x-axis range
+xlim_range <- range(density_df$x, true_coef, finite = TRUE)
+x_padding <- diff(xlim_range) * 0.05
+xlim_range <- c(xlim_range[1] - x_padding, xlim_range[2] + x_padding)
+
+# 5. Calculate annotation positions
+y_at_true <- approx(density_df$x, density_df$y, xout = true_coef, rule = 2)$y
+y_top <- max(density_df$y, na.rm = TRUE)
+
+# True effect label: put on the RIGHT side of dashed line
+y_true_label <- max(1.5, y_at_true * 0.15)
+x_true_label <- true_coef + 0.002
+
+# Placebo stats text: move MUCH more to the right
+x_stats_label <- xlim_range[1] + 0.24 * diff(xlim_range)
+y_stats_label <- y_top * 0.95
+
+# 6. Create plot
+p <- ggplot() +
+
+  # Density curve
+  geom_line(
+    data = density_df,
+    aes(x = x, y = y),
+    color = color_density,
+    linewidth = 1.4
+  ) +
+
+  # Null line (vertical)
+  geom_vline(
+    xintercept = 0,
+    color = color_null,
+    linewidth = 0.7
+  ) +
+
+  # True coefficient line (vertical dashed)
+  geom_vline(
+    xintercept = true_coef,
+    color = color_null,
+    linetype = "dashed",
+    linewidth = 0.7
+  ) +
+
+  # Annotation: True effect (RIGHT of dashed line)
+  annotate(
+    "text",
+    x = x_true_label,
+    y = y_true_label,
+    label = "True effect",
+    hjust = 0,
+    vjust = 0,
+    size = 3.4,
+    color = color_null
+  ) +
+
+  # Annotation: Statistical info (moved right a lot)
+  annotate(
+    "text",
+    x = x_stats_label,
+    y = y_stats_label,
+    label = sprintf(
+      "Placebo mean = %.3f\nZ-score = %.2f\np(one-sided) = %.3f\nn = %d",
+      placebo_mean, z_score, placebo_p_1sided, nrow(placebo_df)
+    ),
+    hjust = 0,
+    vjust = 1,
+    size = 3.2,
+    color = "black",
+    lineheight = 0.9
+  ) +
+
+  # Axis settings
+  coord_cartesian(
+    xlim = xlim_range,
+    ylim = c(0, y_top * 1.05),
+    expand = FALSE,
+    clip = "off"
+  ) +
+
+  # Labels
+  labs(
+    x = "Estimator",
+    y = "Density",
+    title = "Placebo Test: Randomization",
+    subtitle = sprintf(
+      "True: beta = %.4f, HR = %.3f, p = %.4f | Placebo p(one-sided) = %.3f",
+      true_coef, true_hr, true_pval, placebo_p_1sided
+    )
+  ) +
+
+  # Theme settings
+  theme_classic(base_size = 12) +
+  theme(
+    plot.title = element_text(face = "bold", size = 12, margin = margin(b = 6)),
+    plot.subtitle = element_text(size = 10, margin = margin(b = 8)),
+    axis.title = element_text(size = 11),
+    axis.text = element_text(size = 10, color = "black"),
+    axis.line = element_line(color = "black", linewidth = 0.6),
+    axis.ticks = element_line(color = "black", linewidth = 0.6),
+    axis.ticks.length = unit(2.5, "mm"),
+    panel.grid = element_blank(),
+    plot.margin = margin(6, 18, 6, 6)
+  )
+
+# 7. Save figure
+dir.create(path_figures, recursive = TRUE, showWarnings = FALSE)
+
+ggsave(
+  filename = file.path(path_figures, "si_fig5.pdf"),
+  plot = p,
+  width = 180,
+  height = 120,
+  units = "mm",
+  device = "pdf"
+)
+
+print(p)
+
+
+```
+
+
+```{r supplementary fig 6：PSM}
+
+sapply(c("MatchIt", "cobalt"), function(pkg) {
+  if (!require(pkg, character.only = TRUE, quietly = TRUE)) {
+    install.packages(pkg)
+    library(pkg, character.only = TRUE)
+  }
+})
+
+library(MatchIt)
+library(cobalt)
+library(survival)
+library(dplyr)
+library(ggplot2)
+library(grid)
+library(gtable)
+library(tidyr)
+library(tibble)
+
+if (!require(ggtext, quietly = TRUE)) install.packages("ggtext")
+library(ggtext)
+
+# ============================================================
+# 0. Mark special emission-factor records and replace with NA
+# ============================================================
+
+special_ef_values <- c(9460, 9610, 10100)
+
+special_ef_n <- data %>%
+  filter(Emission_factor_kg_of_CO2_per_TJ %in% special_ef_values) %>%
+  nrow()
+
+cat(sprintf(
+  "\nSpecial emission-factor records replaced with NA: %d\n",
+  special_ef_n
+))
+
+# ============================================================
+# 1. Prepare baseline data
+# ============================================================
+
+baseline_data <- data %>%
+  group_by(GEM_unit_phase_ID) %>%
+  arrange(time0) %>%
+  slice(1) %>%
+  ungroup() %>%
+  mutate(
+    treated = as.integer(
+      GEM_unit_phase_ID %in%
+        (data %>%
+           filter(ai_treat_25km_20_24 == 1) %>%
+           pull(GEM_unit_phase_ID) %>%
+           unique())
+    ),
+    Emission_factor_kg_of_CO2_per_TJ = ifelse(
+      Emission_factor_kg_of_CO2_per_TJ %in% special_ef_values,
+      NA,
+      Emission_factor_kg_of_CO2_per_TJ
+    )
+  ) %>%
+  filter(
+    !is.na(Capacity_MW),
+    !is.na(Start_year),
+    !is.na(Heat_rate_Btu_per_kWh),
+    !is.na(Emission_factor_kg_of_CO2_per_TJ),
+    !is.na(rGDP_pc)
+  )
+
+cat(sprintf("Baseline sample after cleaning: %d units\n", nrow(baseline_data)))
+cat(sprintf("Treated units in baseline sample: %d\n", sum(baseline_data$treated == 1)))
+cat(sprintf("Control units in baseline sample: %d\n", sum(baseline_data$treated == 0)))
+
+# ============================================================
+# 2. Matching
+# ============================================================
+
+psm_formula <- treated ~ Capacity_MW + Start_year +
+  Heat_rate_Btu_per_kWh +
+  Emission_factor_kg_of_CO2_per_TJ
+
+set.seed(123)
+match_out <- matchit(
+  psm_formula,
+  data = baseline_data,
+  method = "nearest",
+  distance = "glm",
+  link = "logit",
+  ratio = 10,
+  replace = FALSE,
+  caliper = 0.2
+)
+
+print(summary(match_out))
+
+# ============================================================
+# 3. Unified theme parameters
+# ============================================================
+
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+FIXED_YTITLE_WIDTH <- unit(1.2, "cm")
+FIXED_YAXIS_WIDTH <- unit(1.5, "cm")
+
+PLOT_MARGIN <- margin(12, 40, 12, 20)
+
+# ============================================================
+# 4. PANEL A: BALANCE PLOT
+# ============================================================
+
+bal_tab_result <- bal.tab(match_out, un = TRUE, thresholds = c(m = 0.1))
+
+# print balance table for quick inspection
+bal_check <- bal_tab_result$Balance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  filter(Variable != "distance") %>%
+  dplyr::select(Variable, Diff.Un, Diff.Adj) %>%
+  mutate(
+    abs_un = abs(Diff.Un),
+    abs_adj = abs(Diff.Adj),
+    worsened = abs_adj > abs_un
+  )
+
+print(bal_check)
+
+balance_df <- bal_tab_result$Balance %>%
+  as.data.frame() %>%
+  tibble::rownames_to_column("Variable") %>%
+  filter(Variable != "distance") %>%
+  dplyr::select(Variable, Unadjusted = Diff.Un, Adjusted = Diff.Adj) %>%
+  mutate(
+    Variable_clean = case_when(
+      Variable == "Capacity_MW" ~ "Capacity (MW)",
+      Variable == "Start_year" ~ "Commission Year",
+      Variable == "Heat_rate_Btu_per_kWh" ~ "Heat Rate (Btu/kWh)",
+      Variable == "Emission_factor_kg_of_CO2_per_TJ" ~ "Emission Factor (kg CO<sub>2</sub>/TJ)",
+      TRUE ~ Variable
+    )
+  ) %>%
+  tidyr::pivot_longer(
+    cols = c(Unadjusted, Adjusted),
+    names_to = "Sample",
+    values_to = "SMD"
+  ) %>%
+  mutate(
+    Variable_clean = factor(
+      Variable_clean,
+      levels = rev(c(
+        "Capacity (MW)",
+        "Commission Year",
+        "Heat Rate (Btu/kWh)",
+        "Emission Factor (kg CO<sub>2</sub>/TJ)"
+      ))
+    ),
+    Sample = factor(Sample, levels = c("Unadjusted", "Adjusted"))
+  )
+
+# Use stable x-axis settings to avoid weird scientific notation labels
+x_breaks <- seq(-0.5, 0.5, by = 0.1)
+x_limits <- c(-0.55, 0.55)
+
+p_balance <- ggplot(balance_df, aes(x = SMD, y = Variable_clean, color = Sample, shape = Sample)) +
+  geom_vline(
+    xintercept = 0,
+    linetype = "solid",
+    color = "black",
+    linewidth = LINE_WIDTH_AXIS
+  ) +
+  geom_vline(
+    xintercept = c(-0.1, 0.1),
+    linetype = "dashed",
+    color = "grey60",
+    linewidth = 0.4
+  ) +
+  geom_point(
+    size = 3.5,
+    stroke = 0,
+    alpha = 0.85,
+    position = position_dodge(width = 0.4)
+  ) +
+  scale_color_manual(
+    values = c("Unadjusted" = "#E57373", "Adjusted" = "#4DB6AC"),
+    labels = c("Unadjusted" = "Unadjusted", "Adjusted" = "Adjusted")
+  ) +
+  scale_shape_manual(
+    values = c("Unadjusted" = 16, "Adjusted" = 17),
+    labels = c("Unadjusted" = "Unadjusted", "Adjusted" = "Adjusted")
+  ) +
+  scale_x_continuous(
+    limits = x_limits,
+    breaks = x_breaks,
+    labels = sprintf("%.1f", x_breaks),
+    expand = c(0, 0)
+  ) +
+  labs(
+    x = "Standardized Differences",
+    y = NULL,
+    color = "Sample",
+    shape = "Sample"
+  ) +
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+  theme(
+    text = element_text(family = FONT_FAMILY, color = "black"),
+
+    plot.title = element_text(
+      size = FONT_SIZE_TITLE,
+      hjust = 0,
+      margin = margin(b = 8)
+    ),
+
+    axis.text.x = element_text(
+      size = FONT_SIZE_AXIS_TEXT,
+      color = "black",
+      margin = margin(t = 4)
+    ),
+
+    axis.text.y = element_markdown(
+      size = FONT_SIZE_AXIS_TEXT,
+      color = "black",
+      margin = margin(r = 4)
+    ),
+
+    axis.title.x = element_text(
+      size = FONT_SIZE_AXIS_TITLE,
+      margin = margin(t = 8)
+    ),
+
+    axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+    axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+    axis.ticks.length = unit(2, "pt"),
+
+    legend.position = c(0.83, 0.22),
+    legend.background = element_rect(
+      fill = "white",
+      color = "black",
+      linewidth = 0.4
+    ),
+    legend.title = element_text(size = FONT_SIZE_LEGEND, face = "bold"),
+    legend.text = element_text(size = FONT_SIZE_LEGEND),
+    legend.key.size = unit(0.6, "cm"),
+    legend.spacing.y = unit(0.3, "cm"),
+
+    plot.margin = PLOT_MARGIN,
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  )
+
+plot_balance_grob <- ggplotGrob(p_balance)
+plot_balance_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot_balance_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  file.path(path_figures, "si_fig6a.pdf"),
+  plot = plot_balance_grob,
+  width = 7,
+  height = 3.5,
+  units = "in",
+  device = "pdf"
+)
+
+print(p_balance)
+
+# ============================================================
+# 5. Extract matched sample and run Cox model
+# ============================================================
+
+matched_ids <- baseline_data %>%
+  mutate(matched = !is.na(match_out$weights) & match_out$weights > 0) %>%
+  filter(matched) %>%
+  pull(GEM_unit_phase_ID)
+
+matched_data <- data %>%
+  mutate(
+    Emission_factor_kg_of_CO2_per_TJ = ifelse(
+      Emission_factor_kg_of_CO2_per_TJ %in% special_ef_values,
+      NA,
+      Emission_factor_kg_of_CO2_per_TJ
+    )
+  ) %>%
+  filter(GEM_unit_phase_ID %in% matched_ids)
+
+cat(sprintf(
+  "\nMatched observations: %d (%.1f%% of original)\n",
+  nrow(matched_data),
+  100 * nrow(matched_data) / nrow(data)
+))
+
+distances <- c("25km")
+types <- c("before06", "06_15", "16_19", "20_24")
+results_psm_list <- list()
+
+for (dist in distances) {
+
+  proximity_vars <- paste0("ai_proximity_", dist, "_", types)
+  proximity_formula <- paste(proximity_vars, collapse = " + ")
+
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    proximity_formula,
+    " + Capacity_MW + Start_year + Emission_factor_kg_of_CO2_per_TJ",
+    " + Heat_rate_Btu_per_kWh + rGDP_pc + strata(Alpha_3_code)"
+  )
+
+  cox_model_psm <- coxph(
+    as.formula(formula_str),
+    data = matched_data,
+    cluster = GEM_unit_phase_ID,
+    ties = "efron",
+    control = coxph.control(iter.max = 200)
+  )
+
+  coef_summary <- summary(cox_model_psm)$coefficients
+  has_robust <- "robust se" %in% colnames(coef_summary)
+
+  for (i in 1:4) {
+    type <- types[i]
+    var_name <- proximity_vars[i]
+
+    if (has_robust) {
+      coef_val <- coef_summary[i, "coef"]
+      se <- coef_summary[i, "robust se"]
+      pval <- coef_summary[i, "Pr(>|z|)"]
+    } else {
+      coef_val <- coef_summary[i, "coef"]
+      se <- coef_summary[i, "se(coef)"]
+      pval <- coef_summary[i, "Pr(>|z|)"]
+    }
+
+    hr <- exp(coef_val)
+    ci_lower <- exp(coef_val - 1.96 * se)
+    ci_upper <- exp(coef_val + 1.96 * se)
+
+    result_row <- data.frame(
+      Distance = dist,
+      Type = type,
+      Variable = var_name,
+      Coefficient = coef_val,
+      HR = hr,
+      SE = se,
+      CI_lower = ci_lower,
+      CI_upper = ci_upper,
+      P_value = pval,
+      Sig = case_when(
+        pval < 0.001 ~ "***",
+        pval < 0.01 ~ "**",
+        pval < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    )
+
+    results_psm_list[[length(results_psm_list) + 1]] <- result_row
+  }
+}
+
+results_psm_df <- bind_rows(results_psm_list)
+
+# ============================================================
+# 6. Compare results before and after PSM
+# ============================================================
+
+results_original <- readRDS(file.path(path_temp, "cox_proximity_results_joint.rds")) %>%
+  filter(Distance == "25km")
+
+comparison_df <- results_original %>%
+  dplyr::select(
+    Type, Variable,
+    HR_original = HR,
+    CI_lower_original = CI_lower,
+    CI_upper_original = CI_upper,
+    P_original = P_value,
+    Sig_original = Sig
+  ) %>%
+  left_join(
+    results_psm_df %>%
+      dplyr::select(
+        Type, Variable,
+        HR_psm = HR,
+        CI_lower_psm = CI_lower,
+        CI_upper_psm = CI_upper,
+        P_psm = P_value,
+        Sig_psm = Sig
+      ),
+    by = c("Type", "Variable")
+  )
+
+print(
+  comparison_df %>%
+    dplyr::select(Type, HR_original, HR_psm, Sig_original, Sig_psm)
+)
+
+# ============================================================
+# 7. PANEL B: FOREST PLOT
+# ============================================================
+
+nature_colors <- c(
+  "before06" = "#000080",
+  "06_15" = "#4169E1",
+  "16_19" = "#9E1C60",
+  "20_24" = "#FF4500"
+)
+
+plot_comparison_data <- comparison_df %>%
+  mutate(
+    Type_clean = case_when(
+      Type == "before06" ~ "Before 2006",
+      Type == "06_15" ~ "2006-2015",
+      Type == "16_19" ~ "2016-2019",
+      Type == "20_24" ~ "2020-2024"
+    ),
+    plot_order = case_when(
+      Type_clean == "Before 2006" ~ 4,
+      Type_clean == "2006-2015" ~ 3,
+      Type_clean == "2016-2019" ~ 2,
+      Type_clean == "2020-2024" ~ 1
+    )
+  )
+
+x_min <- min(
+  c(plot_comparison_data$CI_lower_original, plot_comparison_data$CI_lower_psm),
+  na.rm = TRUE
+)
+x_max <- max(
+  c(plot_comparison_data$CI_upper_original, plot_comparison_data$CI_upper_psm),
+  na.rm = TRUE
+)
+x_range <- x_max - x_min
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.30 * x_range
+
+plot_comparison_data <- plot_comparison_data %>%
+  mutate(
+    label_x_original = pmin(CI_upper_original + 0.03 * x_range, x_limit_max - 0.10 * x_range),
+    label_x_psm = pmin(CI_upper_psm + 0.03 * x_range, x_limit_max - 0.10 * x_range),
+    hr_label_original = sprintf("%.3f%s", HR_original, Sig_original),
+    hr_label_psm = sprintf("%.3f%s", HR_psm, Sig_psm)
+  )
+
+forest_plot_psm <- ggplot(plot_comparison_data, aes(y = plot_order)) +
+  geom_vline(
+    xintercept = 1,
+    linetype = "solid",
+    color = "black",
+    linewidth = LINE_WIDTH_AXIS
+  ) +
+
+  geom_errorbarh(
+    aes(xmin = CI_lower_original, xmax = CI_upper_original, color = Type),
+    height = 0,
+    linewidth = LINE_WIDTH_ERROR,
+    alpha = 0.6,
+    linetype = "solid",
+    position = position_nudge(y = 0.15)
+  ) +
+  geom_point(
+    aes(x = HR_original, color = Type, fill = Type),
+    shape = 21,
+    size = POINT_SIZE,
+    stroke = POINT_STROKE,
+    position = position_nudge(y = 0.15)
+  ) +
+  geom_text(
+    aes(x = label_x_original, label = hr_label_original, color = Type),
+    hjust = 0,
+    size = FONT_SIZE_AXIS_TEXT * 0.35,
+    fontface = "bold",
+    position = position_nudge(y = 0.15),
+    family = FONT_FAMILY
+  ) +
+
+  geom_errorbarh(
+    aes(xmin = CI_lower_psm, xmax = CI_upper_psm, color = Type),
+    height = 0,
+    linewidth = LINE_WIDTH_ERROR,
+    linetype = "dashed",
+    position = position_nudge(y = -0.15)
+  ) +
+  geom_point(
+    aes(x = HR_psm, color = Type),
+    shape = 17,
+    size = POINT_SIZE,
+    stroke = POINT_STROKE,
+    position = position_nudge(y = -0.15)
+  ) +
+  geom_text(
+    aes(x = label_x_psm, label = hr_label_psm, color = Type),
+    hjust = 0,
+    size = FONT_SIZE_AXIS_TEXT * 0.35,
+    fontface = "bold",
+    position = position_nudge(y = -0.15),
+    family = FONT_FAMILY
+  ) +
+
+  scale_color_manual(values = nature_colors) +
+  scale_fill_manual(values = c(
+    "before06" = "white",
+    "06_15" = "white",
+    "16_19" = "white",
+    "20_24" = "white"
+  )) +
+
+  labs(
+    x = "Hazard Ratio (95% CI)",
+    y = "Data center commission periods"
+  ) +
+
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+  theme(
+    text = element_text(family = FONT_FAMILY, color = "black"),
+
+    plot.title = element_text(
+      size = FONT_SIZE_TITLE,
+      hjust = 0,
+      margin = margin(b = 8)
+    ),
+
+    axis.text.x = element_text(
+      size = FONT_SIZE_AXIS_TEXT,
+      color = "black",
+      margin = margin(t = 4)
+    ),
+
+    axis.text.y = element_text(
+      size = FONT_SIZE_AXIS_TEXT,
+      color = "black",
+      hjust = 1.1,
+      vjust = 1.1,
+      angle = -30,
+      margin = margin(r = 4)
+    ),
+
+    axis.title.x = element_text(
+      size = FONT_SIZE_AXIS_TITLE,
+      margin = margin(t = 8)
+    ),
+
+    axis.title.y = element_text(
+      size = FONT_SIZE_AXIS_TITLE,
+      angle = 90,
+      margin = margin(r = 8)
+    ),
+
+    axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+    axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+    axis.ticks.length = unit(2, "pt"),
+
+    legend.position = "none",
+
+    plot.margin = PLOT_MARGIN,
+    panel.grid = element_blank(),
+    panel.background = element_rect(fill = "white", color = NA)
+  ) +
+  scale_x_continuous(
+    limits = c(x_limit_min, x_limit_max),
+    breaks = pretty(c(x_min, x_max), n = 6),
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:4,
+    labels = c("2020-2024", "2016-2019", "2006-2015", "Before 2006"),
+    expand = expansion(add = c(0.5, 0.5))
+  )
+
+plot_psm_grob <- ggplotGrob(forest_plot_psm)
+plot_psm_grob$widths[2] <- FIXED_YTITLE_WIDTH
+plot_psm_grob$widths[3] <- FIXED_YAXIS_WIDTH
+
+ggsave(
+  filename = file.path(path_figures, "si_fig6b.pdf"),
+  plot = plot_psm_grob,
+  width = 6,
+  height = 3.5,
+  units = "in",
+  device = "pdf"
+)
+
+print(forest_plot_psm)
+
+
+```
+

@@ -1,0 +1,355 @@
+
+---
+title: "data center and coal power plants retirement"
+date: "`r Sys.Date()`"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+    theme: flatly
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load package, include=FALSE}
+# clear envir
+rm(list = ls())
+```
+
+
+```{r import_and_merge_datasets, include=FALSE}
+library(haven)
+
+current <- getwd()
+while (basename(current) != "Data_center_and_fossil_energy_Replication") {
+  current <- dirname(current)
+}
+base_path <- current
+
+# Sub Path Setting
+path_raw     <- file.path(base_path, "Data", "raw")
+path_temp    <- file.path(base_path, "Data", "temp")
+path_use     <- file.path(base_path, "Data", "use")
+path_figures <- file.path(base_path, "Results", "Figures")
+path_tables  <- file.path(base_path, "Results", "Tables")
+
+# read data
+data <- read_dta(file.path(path_use, "forR_placebo_hyper.dta"))
+
+```
+
+
+```{r fig 3c calculation session}
+# ============================================================
+# Cox Regression: Larger-scale DC Data Centers
+# ============================================================
+library(haven)
+library(survival)
+library(dplyr)
+
+distances <- c("25km")
+types <- c("before06", "06_15", "16_19", "20_24_hyper", "20_24_other")
+
+results_list <- list()
+cox_models_list <- list()
+
+# ============================================================
+# Run Cox Models
+# ============================================================
+for (dist in distances) {
+  
+  proximity_vars <- paste0("ai_proximity_", dist, "_", types)
+  proximity_formula <- paste(proximity_vars, collapse = " + ")
+  
+  formula_str <- paste0(
+    "Surv(time0, time1, retire) ~ ",
+    proximity_formula,
+    " + Capacity_MW",
+    " + Start_year",
+    " + Heat_rate_Btu_per_kWh",
+    " + Emission_factor_kg_of_CO2_per_TJ",
+    " + rGDP_pc",
+    " + strata(Alpha_3_code)"
+  )
+  
+  tryCatch({
+    
+    cox_model <- coxph(
+      as.formula(formula_str), 
+      data = data,
+      cluster = GEM_unit_phase_ID,
+      ties = "efron",
+      control = coxph.control(iter.max = 100)
+    )
+    
+    coef_summary <- summary(cox_model)$coefficients
+    has_robust <- "robust se" %in% colnames(coef_summary)
+    
+    for (i in 1:5) {
+      type <- types[i]
+      var_name <- proximity_vars[i]
+      
+      if (has_robust) {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "robust se"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      } else {
+        coef_val <- coef_summary[i, "coef"]
+        se <- coef_summary[i, "se(coef)"]
+        pval <- coef_summary[i, "Pr(>|z|)"]
+      }
+      
+      hr <- exp(coef_val)
+      ci_lower <- exp(coef_val - 1.96 * se)
+      ci_upper <- exp(coef_val + 1.96 * se)
+      
+      result_row <- data.frame(
+        Distance = dist,
+        Type = type,
+        Variable = var_name,
+        Coefficient = coef_val,
+        HR = hr,
+        SE = se,
+        CI_lower = ci_lower,
+        CI_upper = ci_upper,
+        P_value = pval,
+        Sig = case_when(
+          pval < 0.001 ~ "***",
+          pval < 0.01 ~ "**",
+          pval < 0.05 ~ "*",
+          pval < 0.1 ~ "+",
+          TRUE ~ ""
+        )
+      )
+      
+      results_list[[length(results_list) + 1]] <- result_row
+    }
+    
+    model_key <- paste0(dist, "_largescale")
+    cox_models_list[[model_key]] <- list(
+      model = cox_model,
+      distance = dist,
+      formula = formula_str
+    )
+    
+    cat(sprintf("✓ Successfully fitted Larger-scale DC model for distance: %s\n", dist))
+    
+  }, error = function(e) {
+    cat(sprintf("✗ Error in distance %s: %s\n", dist, e$message))
+  })
+}
+
+# ============================================================
+# Process Results
+# ============================================================
+if (length(results_list) == 0) {
+  stop("No models successfully fitted!")
+}
+
+results_df <- bind_rows(results_list) %>%
+  mutate(
+    Distance_num = as.numeric(gsub("km", "", Distance))
+  ) %>%
+  arrange(Distance_num)
+
+saveRDS(results_df, file.path(path_temp, "cox_proximity_results_largescale.rds"))
+saveRDS(cox_models_list, file.path(path_temp, "cox_proximity_models_largescale.rds"))
+write.csv(results_df, file.path(path_tables, "cox_proximity_results_largescale.csv"), row.names = FALSE)
+
+cat("\n=== Larger-scale DC Data Centers Analysis Completed ===\n")
+cat(sprintf("Total distances fitted: %d\n", length(cox_models_list)))
+cat(sprintf("Total coefficients: %d\n", nrow(results_df)))
+cat(sprintf("Significant results (p < 0.05): %d\n", sum(results_df$P_value < 0.05)))
+
+print(results_df %>% select(Distance, Type, HR, CI_lower, CI_upper, P_value, Sig))
+
+
+```
+
+
+```{r Figure 3c plot session}
+# ============================================================
+# Forest Plot: 25km - 2020-2024 Larger-scale DC vs Other
+# ============================================================
+library(ggplot2)
+library(dplyr)
+
+# Load results
+results_df <- readRDS(file.path(path_temp, "cox_proximity_results_largescale.rds"))
+
+# ============================================================
+# Nature Standards (保持原有设置)
+# ============================================================
+FONT_FAMILY <- "sans"
+FONT_SIZE_BASE <- 10
+FONT_SIZE_TITLE <- 12
+FONT_SIZE_AXIS_TEXT <- 9
+FONT_SIZE_AXIS_TITLE <- 10
+FONT_SIZE_LEGEND <- 9
+FONT_SIZE_CAPTION <- 8
+
+LINE_WIDTH_AXIS <- 0.5
+LINE_WIDTH_ERROR <- 0.8
+POINT_SIZE <- 1.5
+POINT_STROKE <- 1.2
+
+# Colors
+colors <- c(
+  "20_24_hyper" = "#FF4500",    # Larger-scale DC: Orange-red
+  "20_24_other" = "#FF4500"     # Other: Royal blue
+)
+
+# Labels
+labels <- c(
+  "20_24_hyper" = "Larger-scale DC",
+  "20_24_other" = "Smaller-scale DC"
+)
+
+# Theme 
+theme_nature_standard <- function() {
+  theme_classic(base_size = FONT_SIZE_BASE, base_family = FONT_FAMILY) +
+    theme(
+      text = element_text(family = FONT_FAMILY),
+      plot.title = element_text(size = FONT_SIZE_TITLE, hjust = 0, margin = margin(b = 8)),
+      plot.subtitle = element_text(size = FONT_SIZE_AXIS_TITLE, hjust = 0, margin = margin(b = 8)),
+      plot.caption = element_text(size = FONT_SIZE_CAPTION, hjust = 0, color = "grey20", 
+                                  margin = margin(t = 8), lineheight = 1.1),
+      axis.text.x = element_text(size = FONT_SIZE_AXIS_TEXT, color = "black", 
+                                 margin = margin(t = 4)),
+      axis.text.y = element_text(
+        size = FONT_SIZE_AXIS_TEXT, 
+        color = "black",
+        hjust = 1.1,              
+        vjust = 1.1,              
+        angle = -30,              
+        margin = margin(r = 4)
+      ),
+      axis.title.x = element_text(size = FONT_SIZE_AXIS_TITLE, margin = margin(t = 8)),
+      axis.title.y = element_text(
+        size = FONT_SIZE_AXIS_TITLE, 
+        angle = 90,               
+        margin = margin(r = 8)
+      ),
+      axis.line = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks = element_line(color = "black", linewidth = LINE_WIDTH_AXIS),
+      axis.ticks.length = unit(2, "pt"),
+      legend.position = "none", 
+      plot.margin = margin(12, 40, 12, 20), 
+      panel.grid = element_blank()
+    )
+}
+
+# ============================================================
+# Prepare Data
+# ============================================================
+plot_data <- results_df %>%
+  filter(Distance == "25km", Type %in% c("20_24_hyper", "20_24_other")) %>%
+  mutate(
+    Type_label = labels[Type],
+    Type_factor = factor(Type_label, levels = rev(labels)),
+    plot_order = ifelse(Type == "20_24_hyper", 2, 1),
+    hr_label = sprintf("%.3f%s", HR, Sig)
+  )
+
+# Calculate x-axis limits
+x_min <- min(plot_data$CI_lower, na.rm = TRUE)
+x_max <- max(plot_data$CI_upper, na.rm = TRUE)
+x_range <- x_max - x_min
+x_limit_min <- x_min - 0.15 * x_range
+x_limit_max <- x_max + 0.15 * x_range  
+
+# Calculate label positions
+plot_data <- plot_data %>%
+  mutate(
+    label_x = CI_upper + 0.03 * x_range  
+  )
+
+# ============================================================
+# Create Plot
+# ============================================================
+p <- ggplot(plot_data, aes(x = HR, y = plot_order)) +
+  # Reference line at HR = 1
+  geom_vline(xintercept = 1, linetype = "solid", color = "black", 
+             linewidth = LINE_WIDTH_AXIS) +
+  
+  # Error bars (95% CI)
+  geom_errorbarh(aes(xmin = CI_lower, xmax = CI_upper, color = Type), 
+                 height = 0, linewidth = LINE_WIDTH_ERROR) +
+  
+  # Point estimates
+  geom_point(aes(color = Type, fill = Type), shape = 21, size = POINT_SIZE, 
+             stroke = POINT_STROKE) +
+  
+  # HR labels 
+  geom_text(aes(x = label_x, label = hr_label, color = Type), 
+            hjust = 0, vjust = 0.5,
+            size = FONT_SIZE_AXIS_TEXT * 0.35, 
+            fontface = "bold",
+            show.legend = FALSE, 
+            family = FONT_FAMILY) +
+  
+  # Scales
+  scale_color_manual(values = colors, labels = labels, name = "Data Center Type") +
+  scale_fill_manual(values = setNames(rep("white", 2), names(colors)), guide = "none") +
+  scale_x_continuous(
+    limits = c(x_limit_min, x_limit_max),
+    breaks = pretty(c(x_min, x_max), n = 6), 
+    expand = c(0, 0)
+  ) +
+  scale_y_continuous(
+    breaks = 1:2, 
+    labels = rev(labels),
+    expand = expansion(add = c(0.5, 0.5))
+  ) +
+  
+  # Labels
+  labs(
+    title = "Effect of Data Centers on Coal Plant Retirement (2020-2024, 25 km)",
+    x = "Hazard Ratio (95% CI)",
+    y = "Data Center types",  
+    caption = paste(
+      "***p < 0.001, **p < 0.01, *p < 0.05, +p < 0.1",
+      "HR > 1: Accelerate retirement; HR < 1: Delay retirement",
+      "Larger-scale DC: Hyperscale, Crypto Mining, Wholesale, and Cloud Data Centers",
+      "Other: Colocation, Enterprise, and Small Data Centers",
+      sep = "\n"
+    )
+  ) +
+  
+  theme_nature_standard()
+
+# ============================================================
+# Save
+# ============================================================
+ggsave(
+  filename = file.path(path_figures, "fig3c.pdf"),
+  plot = p, 
+  width = 5.5, 
+  height = 4, 
+  units = "in"
+)
+
+print(p)
+
+# ============================================================
+# Print Results Table
+# ============================================================
+cat("\n=== Results Summary ===\n")
+print(plot_data %>% 
+  select(Type = Type_label, HR, CI_lower, CI_upper, P_value, Sig) %>%
+  mutate(
+    CI = sprintf("[%.3f, %.3f]", CI_lower, CI_upper),
+    P_value = sprintf("%.4f", P_value)
+  ) %>%
+  select(Type, HR, CI, P_value, Sig))
+
+```
+
+
+
+
+
