@@ -14,7 +14,6 @@ stdes
 
 encode Combustion_technology, gen(Combustion_technology_temp)
 drop Combustion_technology
-rename Combustion_technology_temp Combustion_technology_temp
 
 encode Coal_type, gen(Coal_type_temp)
 drop Coal_type
