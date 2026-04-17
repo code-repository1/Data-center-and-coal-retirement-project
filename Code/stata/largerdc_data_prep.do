@@ -18,7 +18,6 @@ drop Combustion_technology
 encode Coal_type, gen(Coal_type_temp)
 drop Coal_type
 rename Coal_type_temp Coal_type
-global control_plant_info "i.multi_owner Capacity_MW i.Combustion_technology i.Coal_type Heat_rate_Btu_per_kWh Emission_factor_kg_of_CO2_per_TJ Annual_CO2_million_tonnes_annum Start_year" 
 
 //calculate carbon intensity
 
