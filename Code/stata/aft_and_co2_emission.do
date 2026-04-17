@@ -89,7 +89,7 @@ gen af_change_ci_bottom = exp(coef_change_ci_bottom)
 gen af_change_ci_top = exp(coef_change_ci_top)
 
 
-gen retire_average = 40  // literature： yl 2022 in nc
+gen retire_average = 40  // literature： 2022 in nc
 
 gen life_expect = retire_average if time1 <=retire_average
 
