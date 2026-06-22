@@ -1,7 +1,7 @@
 **generate multi-record coal units survival dataset
 
-global temp "your_own_path/Data/temp"
-global use "your_own_path/Data/use"
+global temp "your_own_path/Data_center_and_fossil_energy_Replication/Data/temp"
+global use "your_own_path/Data_center_and_fossil_energy_Replication/Data/use"
 
 use "$temp/coal_plants_final.dta", clear
 

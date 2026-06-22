@@ -63,6 +63,10 @@ for (industry in industries) {
       " + Heat_rate_Btu_per_kWh",
       " + Emission_factor_kg_of_CO2_per_TJ",
       " + rGDP_pc",
+      " + elec_price_db_uscent_kwh_raw",
+      " + td_loss_pct_output",
+      " + demand_yoy_pct",
+      " + renew_gen_share_pct",
       " + strata(Alpha_3_code)"
     )
     
@@ -156,7 +160,7 @@ results_df <- results_df %>%
   arrange(Industry, Type)
 
 saveRDS(results_df, file.path(path_temp, "cox_proximity_results_industries_25km.rds"))
-write.csv(results_df, file.path(path_tables, "si_table3_source.csv"), row.names = FALSE)
+write.csv(results_df, file.path(path_tables, "sup_table05_cement_placebo_source.csv"), row.names = FALSE)
 
 cat("\n=== Analysis Completed ===\n")
 cat(sprintf("Total coefficients: %d\n", nrow(results_df)))
