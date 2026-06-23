@@ -1,0 +1,177 @@
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r load package, include=FALSE}
+# clear envir
+rm(list = ls())
+```
+
+
+```{r import_and_merge_datasets, include=FALSE}
+library(haven)
+
+current <- getwd()
+while (basename(current) != "Data_center_and_fossil_energy_Replication") {
+  current <- dirname(current)
+}
+base_path <- current
+
+# Sub Path Setting
+path_raw     <- file.path(base_path, "Data", "raw")
+path_temp    <- file.path(base_path, "Data", "temp")
+path_use     <- file.path(base_path, "Data", "use")
+path_figures <- file.path(base_path, "Results", "Figures")
+path_tables  <- file.path(base_path, "Results", "Tables")
+
+# read data
+data <- read_dta(file.path(path_use, "forR_placebo_cement.dta"))
+
+```
+
+
+```{r}
+# ============================================================
+# Cox Regression: Cement, Steel, Iron Ore (25km only)
+# ============================================================
+library(haven)
+library(survival)
+library(dplyr)
+
+distances <- c("25km") 
+types <- c("before06", "06_15", "16_19", "20_24")
+industries <- c("cement")
+
+results_list <- list()
+
+# ============================================================
+# Run Cox Models for Each Industry
+# ============================================================
+for (industry in industries) {
+  for (dist in distances) {
+    
+    proximity_vars <- paste0(industry, "_proximity_", dist, "_", types)
+    proximity_formula <- paste(proximity_vars, collapse = " + ")
+    
+    formula_str <- paste0(
+      "Surv(time0, time1, retire) ~ ",
+      proximity_formula,
+      " + Capacity_MW",
+      " + Start_year",
+      " + Heat_rate_Btu_per_kWh",
+      " + Emission_factor_kg_of_CO2_per_TJ",
+      " + rGDP_pc",
+      " + elec_price_db_uscent_kwh_raw",
+      " + td_loss_pct_output",
+      " + demand_yoy_pct",
+      " + renew_gen_share_pct",
+      " + strata(Alpha_3_code)"
+    )
+    
+    tryCatch({
+      
+      cox_model <- coxph(
+        as.formula(formula_str), 
+        data = data,
+        cluster = GEM_unit_phase_ID,
+        ties = "efron",
+        control = coxph.control(iter.max = 200)
+      )
+      
+      coef_summary <- summary(cox_model)$coefficients
+      has_robust <- "robust se" %in% colnames(coef_summary)
+      
+      # Extract the sample used in the model
+      used_rows <- as.numeric(rownames(model.frame(cox_model)))
+      data_used <- data[used_rows, , drop = FALSE]
+      
+      n_obs <- nrow(data_used)                               
+      n_events <- sum(data_used$retire, na.rm = TRUE)       
+      n_units <- length(unique(data_used$GEM_unit_phase_ID))  
+      
+      # extract coefs
+      for (i in 1:4) {
+        type <- types[i]
+        var_name <- proximity_vars[i]
+        
+        if (has_robust) {
+          coef_val <- coef_summary[i, "coef"]
+          se <- coef_summary[i, "robust se"]
+          pval <- coef_summary[i, "Pr(>|z|)"]
+        } else {
+          coef_val <- coef_summary[i, "coef"]
+          se <- coef_summary[i, "se(coef)"]
+          pval <- coef_summary[i, "Pr(>|z|)"]
+        }
+        
+        hr <- exp(coef_val)
+        ci_lower <- exp(coef_val - 1.96 * se)
+        ci_upper <- exp(coef_val + 1.96 * se)
+        
+        result_row <- data.frame(
+          Industry = industry,
+          Distance = dist,
+          Type = type,
+          Variable = var_name,
+          Coefficient = coef_val,
+          HR = hr,
+          SE = se,
+          CI_lower = ci_lower,
+          CI_upper = ci_upper,
+          P_value = pval,
+          Sig = case_when(
+            pval < 0.001 ~ "***",
+            pval < 0.01 ~ "**",
+            pval < 0.05 ~ "*",
+            TRUE ~ ""
+          ),
+          N_obs = n_obs,           
+          N_units = n_units,     
+          N_retired = n_events     
+        )
+        
+        results_list[[length(results_list) + 1]] <- result_row
+      }
+      
+      cat(sprintf("✓ Successfully fitted %s model for %s (N=%d, Plants=%d, Retired=%d)\n", 
+                  industry, dist, n_obs, n_units, n_events))
+      
+    }, error = function(e) {
+      cat(sprintf("✗ Error in %s %s: %s\n", industry, dist, e$message))
+    })
+  }
+}
+
+# ============================================================
+# Process Results
+# ============================================================
+if (length(results_list) == 0) {
+  stop("No models successfully fitted!")
+}
+
+results_df <- bind_rows(results_list)
+
+period_order <- c("before06", "06_15", "16_19", "20_24")
+
+results_df <- results_df %>%
+  mutate(Type = factor(Type, levels = period_order)) %>%
+  arrange(Industry, Type)
+
+saveRDS(results_df, file.path(path_temp, "cox_proximity_results_industries_25km.rds"))
+write.csv(results_df, file.path(path_tables, "sup_table05_cement_placebo_source.csv"), row.names = FALSE)
+
+cat("\n=== Analysis Completed ===\n")
+cat(sprintf("Total coefficients: %d\n", nrow(results_df)))
+cat(sprintf("Significant results (p < 0.05): %d\n", sum(results_df$P_value < 0.05)))
+cat(sprintf("Sample: N_obs=%d, N_units=%d, N_retired=%d\n", 
+            unique(results_df$N_obs), unique(results_df$N_units), unique(results_df$N_retired)))
+
+cat("\n=== All Coefficients ===\n")
+print(results_df %>% 
+  select(Industry, Type, HR, CI_lower, CI_upper, P_value, Sig, N_obs, N_units, N_retired))
+
+```
+
+
