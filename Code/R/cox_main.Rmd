@@ -6677,7 +6677,12 @@ print(aft_distribution_plot)
 aft_dist_export <- aft_dist_results %>%
   mutate(
     Period = "2020-2024",
-    Variable = "ai_proximity_25km_20_24_z"
+    Variable = "ai_proximity_25km_20_24_z",
+    P_value_display = if_else(
+      P_value < 0.001,
+      "<0.001",
+      formatC(P_value, format = "f", digits = 3)
+    )
   ) %>%
   dplyr::select(
     Distribution,
@@ -6688,11 +6693,12 @@ aft_dist_export <- aft_dist_results %>%
     AF,
     AF_lower,
     AF_upper,
-    P_value,
+    P_value_display,
     AIC,
     BIC,
     N_obs
-  )
+  ) %>%
+  rename(P_value = P_value_display)
 
 write.csv(
   aft_dist_export,
