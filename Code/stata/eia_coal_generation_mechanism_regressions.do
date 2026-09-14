@@ -141,7 +141,7 @@ coeflabels( ///
         ) ///
         fmt(%9s %9s %9s %9.0fc %9.3f) ///
     ) ///
-    title("Extended Data Table X. Data-center exposure and coal-fired generation for U.S. coal plants") ///
+    title("Data-center exposure and coal-fired generation for U.S. coal plants") ///
     addnotes( ///
         "Notes: This table reports plant-year panel regressions using U.S. EIA data for coal-fired power plants from 2001 to 2024. The dependent variable is standardized plant-level coal-fired net generation. DCE measures inverse-distance-weighted exposure to data centers within 25 km, separated by data-center commissioning period. The plant-year panel is constructed using plant information from EIA Form 860 and plant-level annual coal-fired net generation from EIA Form 923, supplemented by earlier EIA Form 906/920 records. State controls include state-level real GDP from the U.S. Bureau of Economic Analysis (https://www.bea.gov/data/gdp/gdp-state), retail electricity prices, total electricity sales, total electricity generation, total installed capacity, renewable generation share and renewable capacity share from EIA historical state data (https://www.eia.gov/electricity/data/state/). Model (1) includes plant and year fixed effects. Model (2) further adds state-level controls. Standard errors, reported in parentheses, are clustered at the plant level. * p < 0.05, ** p < 0.01, *** p < 0.001." ///
     )
