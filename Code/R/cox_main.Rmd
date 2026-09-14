@@ -6486,6 +6486,8 @@ write.csv(
 ```
 
 ```{r sup_fig14_aft_distribution}
+
+# this analysis is run and derived in stata/aft_and_co2_emission.do and the plot in this chunk.
 library(ggplot2)
 library(dplyr)
 library(grid)
